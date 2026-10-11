@@ -38,7 +38,7 @@ micro-benchmark, and frame times of a large MV game on the console went from 30-
 |---|---|
 | bytecode cache (`.jsc` files) | `js_engine_eval_file_cached` evaluates the source |
 | ES modules (`import` in plugins) | `JS_Eval(MODULE)` throws; needs WebKit internals |
-| interrupt handler (`--profile` sampler, watchdog) | no-op |
+| interrupt handler (`--profile` sampler, watchdog) | no-op; `--profile` uses JSC's sampling profiler thread instead |
 | unhandled-rejection tracker | stored, never called; needs a hook in WebKit's `JSGlobalObject` |
 | memory limit, `JS_ComputeMemoryUsage`, GC threshold | no-ops |
 | pooled allocator (`js_pool_alloc.h`) | not used; JSC uses libc malloc |
