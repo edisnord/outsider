@@ -72,6 +72,9 @@ typedef struct GlslTranslation {
    the rewrite cannot express, leaving *out untouched. */
 bool glsl_translate_fragment(const char *source, GlslTranslation *out);
 
+/* Why the last glsl_translate_fragment() call returned false (valid until the next call). */
+const char *glsl_translate_error(void);
+
 /* Release the translated source. */
 void glsl_translation_free(GlslTranslation *t);
 

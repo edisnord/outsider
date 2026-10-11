@@ -13,6 +13,7 @@
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
 #include <SDL3_shadercross/SDL_shadercross.h>
+#include "engine/error_handler.h"
 
 static bool s_ready = false;
 static SDL_GPUShader *s_fullscreen_vertex = NULL;
@@ -72,14 +73,12 @@ static unsigned int *compile_spirv(const char *source, bool vertex_stage,
     if (!shader) return NULL;
 
     if (!glslang_shader_preprocess(shader, &input)) {
-        fprintf(stderr, "gpu: plugin shader preprocess failed:\n%s\n",
-                glslang_shader_get_info_log(shader));
+        compat_report("shader", "glslang preprocess failed", "%s", glslang_shader_get_info_log(shader));
         glslang_shader_delete(shader);
         return NULL;
     }
     if (!glslang_shader_parse(shader, &input)) {
-        fprintf(stderr, "gpu: plugin shader parse failed:\n%s\n",
-                glslang_shader_get_info_log(shader));
+        compat_report("shader", "glslang parse failed", "%s", glslang_shader_get_info_log(shader));
         /* The source the compiler saw is the rewrite, not what the plugin
            wrote, so print it with line numbers or the diagnostic above is
            impossible to place. */
@@ -102,8 +101,7 @@ static unsigned int *compile_spirv(const char *source, bool vertex_stage,
     glslang_program_add_shader(program, shader);
     if (!glslang_program_link(program, GLSLANG_MSG_SPV_RULES_BIT |
                                        GLSLANG_MSG_VULKAN_RULES_BIT)) {
-        fprintf(stderr, "gpu: plugin shader link failed:\n%s\n",
-                glslang_program_get_info_log(program));
+        compat_report("shader", "glslang link failed", "%s", glslang_program_get_info_log(program));
         glslang_program_delete(program);
         glslang_shader_delete(shader);
         return NULL;
@@ -159,8 +157,7 @@ SDL_GPUShader *gpu_shader_runtime_compile(SDL_GPUDevice *device,
     SDL_GPUShader *shader =
         SDL_ShaderCross_CompileGraphicsShaderFromSPIRV(device, &info, &resources, 0);
     if (!shader) {
-        fprintf(stderr, "gpu: shadercross could not build the plugin shader: %s\n",
-                SDL_GetError());
+        compat_report("shader", "shadercross build failed", "%s", SDL_GetError());
     }
     free(spirv);
     return shader;

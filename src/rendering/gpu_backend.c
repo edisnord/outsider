@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "engine/error_handler.h"
 
 #define GPU_TARGET_FORMAT SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM
 
@@ -196,8 +197,7 @@ static SDL_GPUShader *load_shader(const char *name, int sampler_count,
             /* "main" is reserved in MSL, so SPIRV-Cross emits "main0". */
             info.entrypoint = "main0";
         } else {
-            fprintf(stderr, "gpu: no shader format for %s "
-                    "(device accepts 0x%x)\n", name, (unsigned)have);
+            compat_report("render", "no shader format", "%s: device accepts 0x%x", name, (unsigned)have);
             return NULL;
         }
         if (!info.entrypoint) info.entrypoint = "main";
@@ -207,10 +207,10 @@ static SDL_GPUShader *load_shader(const char *name, int sampler_count,
         info.num_uniform_buffers = (Uint32)uniform_count;
 
         SDL_GPUShader *s = SDL_CreateGPUShader(G.device, &info);
-        if (!s) fprintf(stderr, "gpu: SDL_CreateGPUShader(%s): %s\n", name, SDL_GetError());
+        if (!s) compat_report("render", "SDL_CreateGPUShader", "%s: %s", name, SDL_GetError());
         return s;
     }
-    fprintf(stderr, "gpu: shader blob %s missing\n", name);
+    compat_report("render", "shader blob missing", "%s", name);
     return NULL;
 }
 
@@ -265,6 +265,8 @@ static void blend_state(int mode, SDL_GPUColorTargetBlendState *b)
         b->dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_COLOR;
         break;
     default:
+        if (mode != BLEND_MODE_NORMAL && mode != BLEND_MODE_NORMAL_PREMULT)
+            compat_report("render", "blend mode", "mode %d is not implemented, drawn as normal", mode);
         b->src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
         b->dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
         break;
@@ -335,8 +337,8 @@ static SDL_GPUGraphicsPipeline *build_pipeline_for(SDL_GPUShader *vertex_shader,
     info.target_info.color_target_descriptions = &color;
 
     SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(G.device, &info);
-    if (!p) fprintf(stderr, "gpu: pipeline (shader %d blend %d): %s\n",
-                    shader, blend, SDL_GetError());
+    if (!p) compat_report("render", "SDL_CreateGPUGraphicsPipeline", "shader %d blend %d: %s",
+                          shader, blend, SDL_GetError());
     return p;
 }
 
@@ -386,12 +388,12 @@ bool gpu_backend_init(SDL_Window *window)
         SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL |
         SDL_GPU_SHADERFORMAT_MSL, false, NULL);
     if (!G.device) {
-        fprintf(stderr, "gpu: SDL_CreateGPUDevice failed: %s\n", SDL_GetError());
+        compat_report("render", "SDL_CreateGPUDevice", "%s", SDL_GetError());
         return false;
     }
     if (window) {
         if (!SDL_ClaimWindowForGPUDevice(G.device, window)) {
-            fprintf(stderr, "gpu: SDL_ClaimWindowForGPUDevice failed: %s\n", SDL_GetError());
+            compat_report("render", "SDL_ClaimWindowForGPUDevice", "%s", SDL_GetError());
             SDL_DestroyGPUDevice(G.device);
             G.device = NULL;
             return false;
@@ -586,8 +588,7 @@ uint32_t gpu_texture_create(int width, int height, bool render_target)
 
     SDL_GPUTexture *tex = SDL_CreateGPUTexture(G.device, &info);
     if (!tex) {
-        fprintf(stderr, "gpu: SDL_CreateGPUTexture(%dx%d): %s\n",
-                width, height, SDL_GetError());
+        compat_report("render", "SDL_CreateGPUTexture", "%dx%d: %s", width, height, SDL_GetError());
         return 0;
     }
 
@@ -874,6 +875,32 @@ void gpu_record_filter(int shader, const uint32_t *textures, int texture_count,
 
 /* Runtime shaders */
 
+/* A plugin shader that did not make it: counted per shader (the hash of its source) so a filter applied every
+   frame is one line, and the plugin's source is printed once so the failure can be reproduced offline. */
+static void runtime_shader_failed(const char *stage, const char *reason, const char *source, bool dump)
+{
+    unsigned h = 2166136261u;
+    for (const char *p = source; p && *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
+    char key[96];
+    snprintf(key, sizeof(key), "plugin shader %08x: %s", h, stage);
+    compat_report("shader", key, "%s; drawing unfiltered", reason ? reason : "failed");
+
+    static unsigned dumped[32];
+    static int ndumped;
+    if (!dump || !source) return;
+    for (int i = 0; i < ndumped; i++) if (dumped[i] == h) return;
+    if (ndumped < 32) dumped[ndumped++] = h;
+    error_handler_log(LOG_WARN, "[compat] source of plugin shader %08x (%zu bytes):", h, strlen(source));
+    const char *at = source;
+    for (int line = 1; *at && line <= 120; line++) {
+        const char *eol = strchr(at, '\n');
+        int len = eol ? (int)(eol - at) : (int)strlen(at);
+        error_handler_log(LOG_WARN, "[compat] %4d | %.*s", line, len, at);
+        if (!eol) break;
+        at = eol + 1;
+    }
+}
+
 uint32_t gpu_runtime_shader_create(const char *source)
 {
     if (!G.ready || !source) return 0;
@@ -881,8 +908,7 @@ uint32_t gpu_runtime_shader_create(const char *source)
 
     GlslTranslation xlat;
     if (!glsl_translate_fragment(source, &xlat)) {
-        fprintf(stderr, "gpu: plugin shader uses something the rewrite "
-                        "cannot express; drawing unfiltered\n");
+        runtime_shader_failed("translate", glsl_translate_error(), source, true);
         return 0;
     }
 
@@ -890,6 +916,8 @@ uint32_t gpu_runtime_shader_create(const char *source)
         G.device, xlat.source, false, xlat.sampler_count,
         xlat.uniform_size ? 1 : 0);
     if (!shader) {
+        runtime_shader_failed("fragment compile", "the fragment shader did not compile (see gpu: lines above)",
+                              source, true);
         glsl_translation_free(&xlat);
         return 0;
     }
@@ -902,6 +930,7 @@ uint32_t gpu_runtime_shader_create(const char *source)
         ? gpu_shader_runtime_compile(G.device, vertex_src, true, 0, 0) : NULL;
     free(vertex_src);
     if (!vertex) {
+        runtime_shader_failed("vertex compile", "the generated vertex stage did not compile", source, false);
         SDL_ReleaseGPUShader(G.device, shader);
         glsl_translation_free(&xlat);
         return 0;

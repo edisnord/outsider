@@ -12,6 +12,7 @@
 
 #ifdef RMMZ_HAS_GL
 #include "rendering/gl_loader.h"
+#include "engine/error_handler.h"
 #endif
 
 /* Vertex format: position(2f) + texcoord(2f) + color(4f) = 32 bytes. */
@@ -105,7 +106,7 @@ static GLuint compile_shader(GLenum type, const char *src)
     if (!ok) {
         char log[512];
         glGetShaderInfoLog(s, sizeof(log), NULL, log);
-        fprintf(stderr, "sprite_batch: shader compile error: %s\n", log);
+        compat_report("shader", "sprite_batch: shader compile error", "%s", log);
         glDeleteShader(s);
         return 0;
     }
@@ -130,7 +131,7 @@ static GLuint create_program(const char *vert_src, const char *frag_src)
     if (!ok) {
         char log[512];
         glGetProgramInfoLog(prog, sizeof(log), NULL, log);
-        fprintf(stderr, "sprite_batch: program link error: %s\n", log);
+        compat_report("shader", "sprite_batch: program link error", "%s", log);
         glDeleteProgram(prog);
         prog = 0;
     }

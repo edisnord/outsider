@@ -7,6 +7,7 @@
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
+#include "engine/error_handler.h"
 
 #define RMMZ_GL_DEFINE(type, name) type rmmz_##name = NULL;
 RMMZ_GL_FUNCS(RMMZ_GL_DEFINE)
@@ -21,7 +22,7 @@ int gl_loader_init(void)
 #define RMMZ_GL_LOAD(type, name) \
     rmmz_##name = (type)SDL_GL_GetProcAddress(#name); \
     if (!rmmz_##name) { \
-        fprintf(stderr, "OpenGL: missing entry point %s\n", #name); \
+        compat_report("render", "OpenGL entry point " #name, "missing from the driver"); \
         missing++; \
     }
     RMMZ_GL_FUNCS(RMMZ_GL_LOAD)

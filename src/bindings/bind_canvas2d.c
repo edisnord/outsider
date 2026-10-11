@@ -19,6 +19,7 @@
 /* Cap on pixel dimensions so w*h*4 cannot overflow size_t: 16384 (GL max) is
    safe on 64-bit; on 32-bit 16384^2*4 == 2^32 wraps, so cap at 8192 there. */
 #include <stdint.h>
+#include "engine/error_handler.h"
 #if SIZE_MAX > 0xFFFFFFFFu
 #define MAX_PIXEL_DIM 16384
 #else
@@ -122,8 +123,8 @@ static JSValue js_c2d_create(JSContext *ctx, JSValueConst this_val,
     if (canvas2d_bytes_alive() + need > canvas_limit_bytes()) {
         c2d_run_gc(ctx, "canvas memory limit");   /* unreferenced canvases are freed by the garbage collector */
         if (canvas2d_bytes_alive() + need > canvas_limit_bytes()) {
-            fprintf(stderr, "[canvas2d] memory limit: %zu MB in use, refusing a %dx%d canvas\n",
-                    canvas2d_bytes_alive() / (1024 * 1024), w, h);
+            compat_report("canvas2d", "canvas memory limit", "%zu MB in use, refused a %dx%d canvas",
+                          canvas2d_bytes_alive() / (1024 * 1024), w, h);
             return JS_ThrowRangeError(ctx, "out of canvas memory (%zu MB in use): a game made more or bigger images than "
                                            "this console can hold", canvas2d_bytes_alive() / (1024 * 1024));
         }

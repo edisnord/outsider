@@ -27,6 +27,7 @@
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
+#include "engine/error_handler.h"
 #endif
 
 #define MAX_VIDEOS 4
@@ -353,7 +354,7 @@ VideoHandle video_open(const char *path)
         if (!s_videos[i].in_use) { slot = i; break; }
     }
     if (!slot) {
-        fprintf(stderr, "video: too many open videos\n");
+        compat_report("video", "too many open videos", "limit is %d", MAX_VIDEOS);
         return VIDEO_HANDLE_INVALID;
     }
 

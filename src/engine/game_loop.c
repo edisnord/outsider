@@ -693,6 +693,8 @@ bool game_loop_step(GameLoop *loop)
 
     /* --- Debug frame limit: capture the final frame before it is swapped --- */
     loop->total_frames++;
+    compat_set_frame((unsigned long long)loop->total_frames);
+    if ((loop->total_frames & 127) == 0) compat_tick();
     if (ctx) autostart_step(loop, ctx);
     if (ctx) autoscript_step(loop, ctx);
     if (loop->max_frames > 0 && loop->total_frames >= loop->max_frames) {

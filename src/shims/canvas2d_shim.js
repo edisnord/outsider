@@ -149,6 +149,11 @@
 
     /* ---- Enum mappings to native values ---- */
 
+    /* What this context cannot do goes to the compatibility log (error_handler.h), once per kind of request. */
+    function compat(key, detail) {
+        if (typeof globalThis.__compat_report === "function") globalThis.__compat_report("canvas2d", key, detail);
+    }
+
     var _compOps = {
         "source-over": 0,
         "source-atop": 1,
@@ -271,7 +276,10 @@
             this._globalCompositeOperation = v;
             if (this._handle) {
                 var op = _compOps[v];
-                if (op === undefined) op = 0;
+                if (op === undefined) {
+                    compat("globalCompositeOperation=" + v, "operation not supported, drawn as source-over");
+                    op = 0;
+                }
                 __native_canvas2d.setCompositeOp(this._handle, op);
             }
         }
@@ -294,7 +302,7 @@
             this._textAlign = v;
             if (this._handle) {
                 var a = _textAligns[v];
-                if (a === undefined) a = 3;
+                if (a === undefined) { compat("textAlign=" + v, "unknown value, treated as start"); a = 3; }
                 __native_canvas2d.setTextAlign(this._handle, a);
             }
         }
@@ -306,7 +314,7 @@
             this._textBaseline = v;
             if (this._handle) {
                 var b = _textBaselines[v];
-                if (b === undefined) b = 3;
+                if (b === undefined) { compat("textBaseline=" + v, "unknown value, treated as alphabetic"); b = 3; }
                 __native_canvas2d.setTextBaseline(this._handle, b);
             }
         }
@@ -605,6 +613,7 @@
     };
 
     CanvasRenderingContext2D.prototype.createPattern = function(image, rep) {
+        compat("createPattern", "returns an empty object; filling with it draws nothing");
         return {};
     };
 
@@ -1087,6 +1096,12 @@
             }
         }
         if (!any) return;
+        for (var cs = 0; cs < this._path.length; cs++) {
+            if (this._path[cs].pts.length > 10) {
+                compat("clip() with a curved or polygonal path", "clipped to the path's bounding box only");
+                break;
+            }
+        }
         var r = { x: Math.floor(minX), y: Math.floor(minY), w: Math.ceil(maxX) - Math.floor(minX), h: Math.ceil(maxY) - Math.floor(minY) };
         var c = this._clip;
         if (c) {
@@ -1103,7 +1118,41 @@
         return { alpha: true, desynchronized: false };
     };
 
-    CanvasRenderingContext2D.prototype.isPointInPath = function() { return false; };
+    CanvasRenderingContext2D.prototype.isPointInPath = function() {
+        compat("isPointInPath", "always false");
+        return false;
+    };
+
+    /* Properties the context stores but nothing here draws with. Reading gives back what was set; setting one to
+       anything but its default is logged. */
+    [["shadowBlur", 0], ["shadowColor", "rgba(0, 0, 0, 0)"], ["shadowOffsetX", 0], ["shadowOffsetY", 0],
+     ["lineCap", "butt"], ["lineJoin", "miter"], ["miterLimit", 10], ["lineDashOffset", 0], ["filter", "none"],
+     ["direction", "inherit"], ["imageSmoothingEnabled", true], ["imageSmoothingQuality", "low"],
+     ["fontKerning", "auto"], ["letterSpacing", "0px"], ["wordSpacing", "0px"], ["textRendering", "auto"]
+    ].forEach(function(p) {
+        var name = p[0], dflt = p[1], slot = "_set_" + name;
+        Object.defineProperty(CanvasRenderingContext2D.prototype, name, {
+            configurable: true,
+            get: function() { var v = this[slot]; return v === undefined ? dflt : v; },
+            set: function(v) {
+                this[slot] = v;
+                if (v !== dflt)
+                    compat("set " + name + (typeof v === "string" || typeof v === "boolean" ? "=" + String(v).slice(0, 24) : ""),
+                           "stored, has no effect on drawing (value " + String(v).slice(0, 40) + ")");
+            }
+        });
+    });
+
+    /* Standard methods this context lacks. They throw as an absent method would, but say so first, so a game that
+       catches the error still shows up in the log. */
+    ["setLineDash", "getLineDash", "roundRect", "createConicGradient", "isPointInStroke", "drawFocusIfNeeded",
+     "reset"].forEach(function(name) {
+        if (CanvasRenderingContext2D.prototype[name]) return;
+        CanvasRenderingContext2D.prototype[name] = function() {
+            compat(name + "()", "method not implemented");
+            throw new TypeError("CanvasRenderingContext2D." + name + " is not implemented");
+        };
+    });
 
     CanvasRenderingContext2D.prototype._destroy = function() {
         if (this._handle && typeof __native_canvas2d !== "undefined") {

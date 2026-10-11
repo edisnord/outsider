@@ -390,7 +390,7 @@ uint32_t renderer_create_fbo(int width, int height, uint32_t *out_texture)
 
     GLenum status = glCheckNamedFramebufferStatus(fbo, GL_FRAMEBUFFER);
     if (status != GL_FRAMEBUFFER_COMPLETE) {
-        fprintf(stderr, "renderer: FBO incomplete (status 0x%X)\n", status);
+        compat_report("render", "framebuffer incomplete", "status 0x%X", status);
         glDeleteFramebuffers(1, &fbo);
         glDeleteTextures(1, &tex);
         return 0;

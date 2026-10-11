@@ -472,6 +472,22 @@ static JSValue js_console_output(JSContext *ctx, JSValueConst this_val,
         msg[pos] = '\0';
     }
 
+    if (msg && magic >= 1) {
+        /* warnings and errors from the game, its plugins and the shims end up in the compatibility table; digit
+           runs are folded so "tile 12" and "tile 13" count as one problem */
+        char key[160];
+        size_t k = 0;
+        for (const char *p = msg; *p && k + 1 < sizeof(key); p++) {
+            if (*p >= '0' && *p <= '9') {
+                if (k == 0 || key[k - 1] != '#') key[k++] = '#';
+            } else {
+                key[k++] = (*p == '\n' || *p == '\r') ? ' ' : *p;
+            }
+        }
+        key[k] = '\0';
+        compat_report(magic == 2 ? "console-error" : "console-warn", key, "%s", msg);
+    }
+
     if (engine && engine->console_cb) {
         engine->console_cb(level, msg ? msg : "", engine->console_userdata);
     } else {
@@ -494,6 +510,20 @@ static JSValue js_console_output(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* __compat_report(category, key[, detail]): the shims' way into the compatibility log (see error_handler.h). */
+static JSValue js_compat_report(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    const char *cat = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    const char *key = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
+    const char *detail = argc > 2 ? JS_ToCString(ctx, argv[2]) : NULL;
+    compat_report(cat ? cat : "misc", key ? key : "", "%s", detail ? detail : "");
+    if (cat) JS_FreeCString(ctx, cat);
+    if (key) JS_FreeCString(ctx, key);
+    if (detail) JS_FreeCString(ctx, detail);
+    return JS_UNDEFINED;
+}
+
 static void js_register_console(JSContext *ctx)
 {
     JSValue global = JS_GetGlobalObject(ctx);
@@ -510,6 +540,8 @@ static void js_register_console(JSContext *ctx)
                              JS_CFUNC_generic_magic, 2));
 
     JS_SetPropertyStr(ctx, global, "console", console);
+    JS_SetPropertyStr(ctx, global, "__compat_report",
+        JS_NewCFunction(ctx, js_compat_report, "__compat_report", 3));
     JS_FreeValue(ctx, global);
 }
 

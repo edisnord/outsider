@@ -19,6 +19,7 @@
 /* Cap on pixel dimensions so w*h*4 cannot overflow size_t: 16384 (GL max) is
    safe on 64-bit; on 32-bit 16384^2*4 == 2^32 wraps, so cap at 8192 there. */
 #include <stdint.h>
+#include "engine/error_handler.h"
 #if SIZE_MAX > 0xFFFFFFFFu
 #define MAX_PIXEL_DIM 16384
 #else
@@ -481,6 +482,8 @@ static JSValue js_renderer_set_blend(JSContext *ctx, JSValueConst this_val,
 
     int mode;
     if (JS_ToInt32(ctx, &mode, argv[0])) return JS_EXCEPTION;
+    if (mode < BLEND_MODE_NORMAL || mode > BLEND_MODE_NORMAL_PREMULT)
+        compat_report("render", "blend mode", "mode %d requested; only normal, add, multiply and screen exist", mode);
 
     SpriteBatch *batch = renderer_get_batch(s_renderer);
     if (batch) sprite_batch_set_blend_mode(batch, mode);

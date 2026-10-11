@@ -53,4 +53,26 @@ bool error_handler_attempt_auto_save(void *engine);
 /* Get the log level name as a string (e.g., "DEBUG", "INFO"). */
 const char *error_handler_level_name(LogLevel level);
 
+/* Compatibility log: things the game asked for that this runtime does not do (or does differently), and errors
+   the game hit. Each (category, key) pair is logged in full the first time, then counted; the line repeats at
+   10, 100, 1000... occurrences and a table of everything is printed every minute and at shutdown. Lines start with
+   "[compat]" so a log can be searched for them. `key` identifies the problem (keep it free of ids and numbers that
+   change, or every occurrence counts as a new problem); `fmt` is the human detail and may vary. Thread-safe.
+   Categories in use: exception, rejection, console-error, console-warn, webgl, canvas2d, render, shader, asset,
+   audio, video, api. */
+void compat_report(const char *category, const char *key, const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 3, 4)))
+#endif
+    ;
+
+/* The frame number stamped on new entries (called by the game loop). */
+void compat_set_frame(unsigned long long frame);
+
+/* Print the summary table if a minute has passed and something changed since the last one. */
+void compat_tick(void);
+
+/* Print the summary table now. */
+void compat_summary(void);
+
 #endif /* RMMZ_ERROR_HANDLER_H */

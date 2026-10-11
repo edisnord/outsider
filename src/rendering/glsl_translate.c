@@ -161,9 +161,25 @@ static bool starts_with_word(const char *p, const char *word)
              (after >= '0' && after <= '9') || after == '_');
 }
 
+static char s_error[160];
+
+static void set_error(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_error, sizeof(s_error), fmt, ap);
+    va_end(ap);
+}
+
+const char *glsl_translate_error(void)
+{
+    return s_error[0] ? s_error : "unknown";
+}
+
 bool glsl_translate_fragment(const char *source, GlslTranslation *out)
 {
-    if (!source || !out) return false;
+    s_error[0] = '\0';
+    if (!source || !out) { set_error("no source"); return false; }
 
     char *src = strip_comments(source);
     if (!src) return false;
@@ -206,7 +222,7 @@ bool glsl_translate_fragment(const char *source, GlslTranslation *out)
                 q = next_word(q, type, sizeof(type));
                 q = next_word(q, name, sizeof(name));
                 if (type[0] && name[0]) {
-                    if (varying_location >= GLSL_MAX_VARYINGS) goto fail;
+                    if (varying_location >= GLSL_MAX_VARYINGS) { set_error("more than %d varyings", GLSL_MAX_VARYINGS); goto fail; }
                     snprintf(t.varyings[varying_location].name, GLSL_MAX_NAME, "%s", name);
                     snprintf(t.varyings[varying_location].type,
                              sizeof(t.varyings[0].type), "%s", type);
@@ -226,7 +242,7 @@ bool glsl_translate_fragment(const char *source, GlslTranslation *out)
                 bool is_array = (*q == '[');
 
                 if (is_sampler_type(type)) {
-                    if (t.sampler_count >= GLSL_MAX_SAMPLERS) goto fail;
+                    if (t.sampler_count >= GLSL_MAX_SAMPLERS) { set_error("more than %d samplers", GLSL_MAX_SAMPLERS); goto fail; }
                     snprintf(t.samplers[t.sampler_count], GLSL_MAX_NAME, "%s", name);
                     buf_printf(&body,
                                "layout(set = 2, binding = %d) uniform %s %s;\n",
@@ -235,8 +251,8 @@ bool glsl_translate_fragment(const char *source, GlslTranslation *out)
                     consumed = true;
                 } else if (!is_array) {
                     const GlslType *gt = find_type(type);
-                    if (!gt) goto fail;
-                    if (t.uniform_count >= GLSL_MAX_UNIFORMS) goto fail;
+                    if (!gt) { set_error("uniform '%s' has unsupported type '%s'", name, type); goto fail; }
+                    if (t.uniform_count >= GLSL_MAX_UNIFORMS) { set_error("more than %d uniforms", GLSL_MAX_UNIFORMS); goto fail; }
                     offset = align_up(offset, gt->align);
                     GlslUniform *u = &t.uniforms[t.uniform_count++];
                     snprintf(u->name, GLSL_MAX_NAME, "%s", name);
@@ -270,7 +286,7 @@ bool glsl_translate_fragment(const char *source, GlslTranslation *out)
     }
     (void)line_start;
 
-    if (body.failed) goto fail;
+    if (body.failed) { set_error("out of memory"); goto fail; }
 
     t.varying_count = varying_location;
 
@@ -317,6 +333,7 @@ bool glsl_translate_fragment(const char *source, GlslTranslation *out)
 
     if (outbuf.failed) {
         free(outbuf.data);
+        set_error("out of memory");
         goto fail;
     }
 

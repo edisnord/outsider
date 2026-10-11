@@ -397,6 +397,7 @@
         try {
             (0, eval)(source);
         } catch (e) {
+            _compatThrown("exception", "script " + (src || "(inline)") + " failed: " + (e && e.message || e), e);
             if (typeof console !== "undefined") {
                 console.error("script " + (src || "(inline)") + ": " + (e && e.stack || e));
             }
@@ -754,27 +755,45 @@
             return this._context2d;
         }
         if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
-            /* WebGL context stub; rendering goes through the native renderer. */
+            /* WebGL context stub; rendering goes through the native renderer. Anything a game does with the
+               context beyond these members is a use of WebGL this runtime cannot honour, so it is logged. */
             if (!this._contextWebGL) {
-                this._contextWebGL = {
+                var report = function(key, detail) {
+                    if (typeof globalThis.__compat_report === "function") globalThis.__compat_report("webgl", key, detail);
+                };
+                report("getContext(" + type + ")", "a game script asked for a WebGL context; only a stub is available");
+                var stub = {
                     canvas: this,
                     drawingBufferWidth: this._width,
                     drawingBufferHeight: this._height,
-                    getParameter: function() { return null; },
-                    getExtension: function() { return null; },
+                    getParameter: function(p) { report("getParameter(" + p + ")", "returned null"); return null; },
+                    getExtension: function(n) { report("getExtension(" + n + ")", "returned null"); return null; },
                     isContextLost: function() { return false; }
                 };
+                this._contextWebGL = typeof Proxy === "function" ? new Proxy(stub, {
+                    get: function(target, prop, receiver) {
+                        if (typeof prop === "string" && !(prop in target) && prop !== "then" && prop !== "toJSON")
+                            report("gl." + prop, "WebGL member read on the stub context, not implemented");
+                        return Reflect.get(target, prop, receiver);
+                    }
+                }) : stub;
             }
             return this._contextWebGL;
         }
+        if (typeof globalThis.__compat_report === "function")
+            globalThis.__compat_report("api", "getContext(" + type + ")", "context type not supported, returned null");
         return null;
     };
 
     HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
+        if (typeof globalThis.__compat_report === "function")
+            globalThis.__compat_report("canvas2d", "HTMLCanvasElement.toDataURL", "returns an empty data URL");
         return "data:image/png;base64,";
     };
 
     HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+        if (typeof globalThis.__compat_report === "function")
+            globalThis.__compat_report("canvas2d", "HTMLCanvasElement.toBlob", "calls back with an empty blob");
         var blob = new Blob([], { type: type || "image/png" });
         if (typeof callback === "function") {
             callback(blob);
@@ -1813,9 +1832,33 @@
 
     window.onunhandledrejection = null;
 
+    /* Puts an uncaught error or unhandled rejection in the compatibility log (see error_handler.h): one entry per
+       message shape and throw site, so a plugin that throws every frame is one line with a count. The stack is the
+       engine's own format ("fn@file:line:col" on JavaScriptCore, "at fn (file:line)" on QuickJS). */
+    function _compatThrown(category, message, errorObj) {
+        if (typeof globalThis.__compat_report !== "function") return;
+        try {
+            var msg = String(message === undefined ? "" : message).replace(/\s+/g, " ");
+            var frames = [];
+            var st = errorObj && typeof errorObj === "object" ? errorObj.stack : null;
+            if (typeof st === "string") {
+                var lines = st.split("\n");
+                for (var i = 0; i < lines.length && frames.length < 4; i++) {
+                    var l = lines[i].trim();
+                    if (!l || l.indexOf("[native code]") >= 0) continue;
+                    if (!/:\d+/.test(l)) continue;
+                    frames.push(l.length > 110 ? l.slice(0, 110) : l);
+                }
+            }
+            var key = msg.replace(/\d+/g, "#").slice(0, 100) + " @ " + (frames[0] || "?");
+            globalThis.__compat_report(category, key, msg.slice(0, 120) + (frames.length > 1 ? " << " + frames.slice(1).join(" < ") : ""));
+        } catch (ignore) { /* logging must never throw */ }
+    }
+
     /* Called from the native error handler; routes to window.onerror
        (browser signature) and then 'error' event listeners. */
     globalThis.__error_handler_dispatch = function(message, errorObj) {
+        _compatThrown("exception", message, errorObj);
         if (typeof window.onerror === "function") {
             try {
                 var handled = window.onerror(message, "", 0, 0, errorObj);
@@ -1836,6 +1879,8 @@
 
     /* Called from C for unhandled promise rejections. */
     globalThis.__error_handler_dispatchRejection = function(reason) {
+        _compatThrown("rejection", reason && typeof reason === "object" && reason.message !== undefined ?
+            (reason.name ? reason.name + ": " : "") + reason.message : reason, reason);
         if (typeof window.onunhandledrejection === "function") {
             try {
                 var evt = {

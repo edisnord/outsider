@@ -26,6 +26,7 @@
 #include "stb_image.h"
 
 #include "rendering/renderer.h"
+#include "engine/error_handler.h"
 
 typedef struct CacheEntry {
     char        *key;       /* File path or blob key (owned). */
@@ -107,7 +108,7 @@ static CacheEntry *cache_insert(const char *key, uint8_t *pixels,
         }
     }
     if (new_handle == 0) {
-        fprintf(stderr, "image_loader: handle limit exceeded\n");
+        compat_report("render", "image handle limit", "too many images alive at once");
         free(entry);
         return NULL;
     }
@@ -200,12 +201,12 @@ ImageHandle image_load(const char *path)
     size_t file_size = 0;
     uint8_t *file_data = file_io_read_binary(path, &file_size);
     if (!file_data) {
-        fprintf(stderr, "image_load: failed to read file: %s\n", path);
+        compat_report("asset", path, "image: failed to read file");
         return IMAGE_HANDLE_INVALID;
     }
 
     if (file_size > INT_MAX) {
-        fprintf(stderr, "image_load: file too large: %s\n", path);
+        compat_report("asset", path, "image: file too large (%zu bytes)", file_size);
         free(file_data);
         return IMAGE_HANDLE_INVALID;
     }
@@ -214,8 +215,7 @@ ImageHandle image_load(const char *path)
     free(file_data);
 
     if (!pixels) {
-        fprintf(stderr, "image_load: failed to decode image: %s (%s)\n",
-                path, stbi_failure_reason());
+        compat_report("asset", path, "image: failed to decode (%s)", stbi_failure_reason());
         return IMAGE_HANDLE_INVALID;
     }
 
@@ -246,8 +246,7 @@ ImageHandle image_load_from_memory(const char *key,
     int w, h;
     uint8_t *pixels = decode_rgba(data, size, &w, &h);
     if (!pixels) {
-        fprintf(stderr, "image_load_from_memory: failed to decode (%s)\n",
-                stbi_failure_reason());
+        compat_report("asset", "image from memory", "failed to decode (%s), %zu bytes", stbi_failure_reason(), size);
         return IMAGE_HANDLE_INVALID;
     }
 

@@ -15,6 +15,7 @@
 #include <time.h>
 
 static FILE *s_log_file = NULL;
+static SDL_Mutex *s_compat_lock = NULL;
 static LogLevel s_min_level = LOG_DEBUG;
 static LogCallback s_callback = NULL;
 static void *s_callback_userdata = NULL;
@@ -26,6 +27,7 @@ static const char *s_level_names[] = {
 void error_handler_init(const char *log_file_path, LogLevel min_level)
 {
     s_min_level = min_level;
+    if (!s_compat_lock) s_compat_lock = SDL_CreateMutex();
 
     if (log_file_path) {
         s_log_file = fopen(log_file_path, "a");
@@ -37,6 +39,7 @@ void error_handler_init(const char *log_file_path, LogLevel min_level)
 
 void error_handler_shutdown(void)
 {
+    compat_summary();
     if (s_log_file) {
         fclose(s_log_file);
         s_log_file = NULL;
@@ -257,4 +260,166 @@ bool error_handler_attempt_auto_save(void *engine_ptr)
     }
 
     return saved;
+}
+
+/* ---- compatibility log ---- */
+
+#define COMPAT_MAX 512
+#define COMPAT_CAT 20
+#define COMPAT_KEY 168
+#define COMPAT_DETAIL 480
+
+typedef struct {
+    char cat[COMPAT_CAT];
+    char key[COMPAT_KEY];
+    char detail[COMPAT_DETAIL];
+    unsigned long long count;
+    unsigned long long next_log;
+    unsigned long long first_frame;
+    double first_s;
+    int used;
+} CompatEntry;
+
+static CompatEntry s_compat[COMPAT_MAX];
+static int s_compat_used;
+static unsigned long long s_compat_total;
+static unsigned long long s_compat_overflow;
+static unsigned long long s_compat_frame;
+static unsigned long long s_compat_printed_total;
+static double s_compat_last_summary_s;
+
+static double compat_now_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    static double base = -1.0;
+    double now = (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+    if (base < 0.0) base = now;
+    return now - base;
+}
+
+static unsigned compat_hash(const char *cat, const char *key)
+{
+    unsigned h = 2166136261u;
+    for (const char *p = cat; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
+    h = (h ^ 0xFFu) * 16777619u;
+    for (const char *p = key; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
+    return h;
+}
+
+void compat_set_frame(unsigned long long frame)
+{
+    s_compat_frame = frame;
+}
+
+void compat_report(const char *category, const char *key, const char *fmt, ...)
+{
+    char detail[COMPAT_DETAIL];
+    detail[0] = '\0';
+    if (fmt) {
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(detail, sizeof(detail), fmt, args);
+        va_end(args);
+    }
+    if (!category) category = "misc";
+    if (!key || !*key) key = detail;
+
+    char cat[COMPAT_CAT], k[COMPAT_KEY];
+    snprintf(cat, sizeof(cat), "%s", category);
+    snprintf(k, sizeof(k), "%s", key);
+    /* a key is one line */
+    for (char *p = k; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+    for (char *p = detail; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+
+    int log_first = 0;
+    int log_repeat = 0;
+    unsigned long long count = 0;
+    double now = compat_now_s();
+
+    if (s_compat_lock) SDL_LockMutex(s_compat_lock);
+    s_compat_total++;
+    unsigned h = compat_hash(cat, k);
+    CompatEntry *e = NULL;
+    for (int i = 0; i < COMPAT_MAX; i++) {
+        CompatEntry *c = &s_compat[(h + (unsigned)i) % COMPAT_MAX];
+        if (!c->used) {
+            if (s_compat_used >= COMPAT_MAX - 1) break;      /* keep one slot free; the table is full */
+            c->used = 1;
+            snprintf(c->cat, sizeof(c->cat), "%s", cat);
+            snprintf(c->key, sizeof(c->key), "%s", k);
+            snprintf(c->detail, sizeof(c->detail), "%s", detail);
+            c->first_frame = s_compat_frame;
+            c->first_s = now;
+            c->next_log = 10;
+            s_compat_used++;
+            e = c;
+            log_first = 1;
+            break;
+        }
+        if (strcmp(c->cat, cat) == 0 && strcmp(c->key, k) == 0) { e = c; break; }
+    }
+    if (e) {
+        e->count++;
+        count = e->count;
+        if (!log_first && e->count >= e->next_log) {
+            e->next_log *= 10;
+            log_repeat = 1;
+        }
+    } else {
+        log_first = (++s_compat_overflow == 1);
+    }
+    if (s_compat_lock) SDL_UnlockMutex(s_compat_lock);
+
+    if (log_first && e) {
+        error_handler_log(LOG_WARN, "[compat] %s: %s%s%s (t=%.1fs frame %llu)", cat, k,
+                          detail[0] && strcmp(detail, k) != 0 ? " -- " : "",
+                          detail[0] && strcmp(detail, k) != 0 ? detail : "", now, s_compat_frame);
+    } else if (log_first) {
+        error_handler_log(LOG_WARN, "[compat] table full (%d entries); further new problems are only counted", COMPAT_MAX);
+    } else if (log_repeat) {
+        error_handler_log(LOG_WARN, "[compat] %s: %s x%llu", cat, k, count);
+    }
+}
+
+static int compat_cmp(const void *a, const void *b)
+{
+    const CompatEntry *x = *(const CompatEntry *const *)a;
+    const CompatEntry *y = *(const CompatEntry *const *)b;
+    int c = strcmp(x->cat, y->cat);
+    if (c) return c;
+    if (x->count != y->count) return x->count < y->count ? 1 : -1;
+    return strcmp(x->key, y->key);
+}
+
+void compat_summary(void)
+{
+    if (s_compat_lock) SDL_LockMutex(s_compat_lock);
+    int n = 0;
+    static const CompatEntry *list[COMPAT_MAX];
+    unsigned long long total = s_compat_total;
+    unsigned long long overflow = s_compat_overflow;
+    for (int i = 0; i < COMPAT_MAX; i++)
+        if (s_compat[i].used) list[n++] = &s_compat[i];
+    qsort(list, (size_t)n, sizeof(list[0]), compat_cmp);
+    s_compat_printed_total = total;
+    s_compat_last_summary_s = compat_now_s();
+    double now = s_compat_last_summary_s;
+
+    error_handler_log(LOG_WARN, "[compat] ---- summary at %.0f s, frame %llu: %d distinct, %llu total%s ----", now,
+                      s_compat_frame, n, total, overflow ? " (table was full)" : "");
+    for (int i = 0; i < n; i++) {
+        const CompatEntry *e = list[i];
+        error_handler_log(LOG_WARN, "[compat] %8llux %-13s %s%s%s (first t=%.1fs frame %llu)", e->count, e->cat, e->key,
+                          e->detail[0] && strcmp(e->detail, e->key) != 0 ? " -- " : "",
+                          e->detail[0] && strcmp(e->detail, e->key) != 0 ? e->detail : "", e->first_s, e->first_frame);
+    }
+    if (s_compat_lock) SDL_UnlockMutex(s_compat_lock);
+}
+
+void compat_tick(void)
+{
+    if (s_compat_total == s_compat_printed_total) return;
+    if (compat_now_s() - s_compat_last_summary_s < 60.0) return;
+    compat_summary();
 }
