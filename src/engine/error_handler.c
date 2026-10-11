@@ -50,21 +50,38 @@ static pthread_t s_logq_thread;
 static volatile int s_async;        /* queueing is on */
 static int s_logq_running, s_logq_busy, s_logq_stop;
 
+static long long log_now_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+}
+
+/* One line to every sink. The file is flushed by the caller (once per batch, not per line: on the console each
+   flush is a write that costs 50-300 ms, and a profile report is 100 lines). Slow sinks are named, a few times. */
 static void log_emit(int level, const char *timestamp, const char *msg)
 {
+    static int slow_reported;
     const char *level_name = error_handler_level_name((LogLevel)level);
     FILE *out = (level >= LOG_WARN) ? stderr : stdout;
+    long long t0 = log_now_us();
     fprintf(out, "[%s] [%s] %s\n", timestamp, level_name, msg);
-    if (s_log_file) {
-        fprintf(s_log_file, "[%s] [%s] %s\n", timestamp, level_name, msg);
-        fflush(s_log_file);
-    }
+    long long t1 = log_now_us();
+    if (s_log_file) fprintf(s_log_file, "[%s] [%s] %s\n", timestamp, level_name, msg);
+    long long t2 = log_now_us();
     if (s_callback) s_callback((LogLevel)level, msg, s_callback_userdata);
+    long long t3 = log_now_us();
+    if (t3 - t0 > 100000 && slow_reported < 5) {
+        slow_reported++;
+        fprintf(stderr, "error_handler: slow log write %lld ms: stdio %lld ms, file %lld ms, callback %lld ms\n",
+                (t3 - t0) / 1000, (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000);
+    }
 }
 
 static void *logq_thread(void *arg)
 {
     (void)arg;
+    long long last_file_flush_us = 0;
     pthread_mutex_lock(&s_logq_lock);
     for (;;) {
         while (s_logq_count == 0 && !s_logq_stop) {
@@ -80,7 +97,15 @@ static void *logq_thread(void *arg)
         unsigned long long dropped = s_logq_dropped - s_logq_reported_dropped;
         s_logq_reported_dropped = s_logq_dropped;
         s_logq_busy = 1;
+        int behind = s_logq_count;
         pthread_mutex_unlock(&s_logq_lock);
+        {
+            static int backlog_reported;
+            if (behind > 300 && backlog_reported < 4) {
+                backlog_reported++;
+                fprintf(stderr, "error_handler: log writer is %d messages behind\n", behind);
+            }
+        }
 
         if (dropped) {
             char note[96];
@@ -91,6 +116,18 @@ static void *logq_thread(void *arg)
         free(it.text);
 
         pthread_mutex_lock(&s_logq_lock);
+        if (s_log_file && (s_logq_count == 0 || log_now_us() - last_file_flush_us > 500000)) {
+            pthread_mutex_unlock(&s_logq_lock);
+            long long f0 = log_now_us();
+            fflush(s_log_file);
+            last_file_flush_us = log_now_us();
+            if (last_file_flush_us - f0 > 100000) {
+                static int reported;
+                if (reported++ < 5)
+                    fprintf(stderr, "error_handler: log file flush took %lld ms\n", (last_file_flush_us - f0) / 1000);
+            }
+            pthread_mutex_lock(&s_logq_lock);
+        }
     }
     s_logq_busy = 0;
     pthread_cond_broadcast(&s_logq_idle);
