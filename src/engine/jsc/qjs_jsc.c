@@ -51,6 +51,8 @@ __attribute__((weak)) time_t timegm(struct tm *tm)
 
 /* JSContextRefPrivate.h */
 extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
+extern void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObjectRef function,
+                                                         JSValueRef *exception);
 
 #define MAX_CLASSES 64
 #define MAX_CONTEXTS 16
@@ -254,6 +256,27 @@ static void ensure_func_class(JSRuntime *rt)
     rt->func_class = JSClassCreate(&d);
 }
 
+/* JSC reports a promise nobody handled once the microtask queue has drained (VM::didExhaustMicrotaskQueue), through
+   a private entry point of the C API; QuickJS calls its tracker at the moment of the rejection. The callback gets
+   (promise, reason) and is only invoked for promises still unhandled, so it maps to is_handled == false. */
+static JSValue rejection_native(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc >= 2 && ctx->rt->rejection_cb)
+        ctx->rt->rejection_cb(ctx, argv[0], argv[1], false, ctx->rt->rejection_opaque);
+    return JS_UNDEFINED;
+}
+
+static void install_rejection_hook(JSContext *ctx)
+{
+    if (!ctx->rt->rejection_cb) return;
+    JSValue f = JS_NewCFunction(ctx, rejection_native, "unhandledRejection", 2);
+    if (f.tag != JSV_REF) return;
+    JSValueRef exc = NULL;
+    JSGlobalContextSetUnhandledRejectionCallback(ctx->g, (JSObjectRef)f.u.ref, &exc);
+    JS_FreeValue(ctx, f);   /* the global object keeps the callback alive */
+}
+
 JSContext *JS_NewContext(JSRuntime *rt)
 {
     JSContext *ctx = calloc(1, sizeof *ctx);
@@ -281,6 +304,7 @@ JSContext *JS_NewContext(JSRuntime *rt)
             JSValueProtect(ctx->g, proto);
         }
     }
+    install_rejection_hook(ctx);
     static int self_tested;
     if (!self_tested) {
         /* Three timed runs of the same function, to tell the tiers apart in the log: the first runs in the
@@ -338,8 +362,10 @@ void JS_SetModuleLoaderFunc2(JSRuntime *rt, void *n, JSModuleLoaderFunc2 *l, JSM
 
 void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTracker *cb, void *opaque)
 {
-    rt->rejection_cb = cb;      /* JSC's C API has no hook for it: stored, never called (see jsc-port.md) */
+    rt->rejection_cb = cb;
     rt->rejection_opaque = opaque;
+    for (int i = 0; i < MAX_CONTEXTS; i++)
+        if (g_ctxs[i] && g_ctxs[i]->rt == rt) install_rejection_hook(g_ctxs[i]);
 }
 
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
