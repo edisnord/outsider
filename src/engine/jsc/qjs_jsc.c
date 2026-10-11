@@ -275,6 +275,21 @@ JSContext *JS_NewContext(JSRuntime *rt)
             JSValueProtect(ctx->g, proto);
         }
     }
+    static int self_tested;
+    if (!self_tested) {
+        /* Says in the log whether the JIT is running: about 10 ms with it, 100 ms or more without. */
+        self_tested = 1;
+        static const char src[] = "(function f(n){return n<2?n:f(n-1)+f(n-2)})(27)";
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        JSStringRef js = JSStringCreateWithUTF8CString(src);
+        JSValueRef r = JSEvaluateScript(ctx->g, js, NULL, NULL, 1, NULL);
+        JSStringRelease(js);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "jsc: self-test fib(27) = %.0f took %.1f ms (JIT %s)\n", r ? JSValueToNumber(ctx->g, r, NULL) : -1.0,
+                (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+                (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 < 40 ? "on" : "probably off");
+    }
     return ctx;
 }
 
