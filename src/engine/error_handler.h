@@ -27,6 +27,11 @@ void error_handler_init(const char *log_file_path, LogLevel min_level);
 /* Shut down the error handler and close any open log file. */
 void error_handler_shutdown(void);
 
+/* Waits until the messages queued so far are written (a no-op when output is synchronous). The console build
+   writes from a thread so that a slow log never stalls the game; call this before something that may kill the
+   process. */
+void error_handler_flush(int timeout_ms);
+
 /* Log a message at the given level. Supports printf-style format strings. */
 void error_handler_log(LogLevel level, const char *fmt, ...);
 

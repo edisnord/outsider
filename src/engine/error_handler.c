@@ -14,6 +14,11 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef _WIN32
+#include <pthread.h>
+#define RMMZ_LOG_THREAD 1
+#endif
+
 static FILE *s_log_file = NULL;
 static SDL_Mutex *s_compat_lock = NULL;
 static LogLevel s_min_level = LOG_DEBUG;
@@ -23,6 +28,145 @@ static void *s_callback_userdata = NULL;
 static const char *s_level_names[] = {
     "DEBUG", "INFO", "WARN", "ERROR"
 };
+
+
+/* ---- asynchronous log output ---------------------------------------------------------------------------
+   On the console a line written to stdout/stderr costs 50-150 ms, and more as a run goes on (see the "slow log call"
+   notes in docs/tasks/outsider-fh2-log.md), so a 100-line profile report froze the game for 8 s, then 31 s, then
+   minutes. With the writer thread on, error_handler_log() formats the line and queues it; the thread does the
+   stdout/stderr write, the file write and the callback. The queue never blocks the caller: when it is full the
+   message is dropped and counted. On by default in the embedded (console) build; RMMZ_LOG_SYNC=1 turns it off and
+   RMMZ_LOG_ASYNC=1 turns it on elsewhere. Order is kept. The callback runs on the writer thread. */
+#ifdef RMMZ_LOG_THREAD
+#define LOGQ_CAP 4096
+typedef struct { char *text; char ts[32]; int level; } LogQItem;
+static LogQItem s_logq[LOGQ_CAP];
+static int s_logq_head, s_logq_count;
+static unsigned long long s_logq_dropped, s_logq_reported_dropped;
+static pthread_mutex_t s_logq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_logq_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t s_logq_idle = PTHREAD_COND_INITIALIZER;
+static pthread_t s_logq_thread;
+static volatile int s_async;        /* queueing is on */
+static int s_logq_running, s_logq_busy, s_logq_stop;
+
+static void log_emit(int level, const char *timestamp, const char *msg)
+{
+    const char *level_name = error_handler_level_name((LogLevel)level);
+    FILE *out = (level >= LOG_WARN) ? stderr : stdout;
+    fprintf(out, "[%s] [%s] %s\n", timestamp, level_name, msg);
+    if (s_log_file) {
+        fprintf(s_log_file, "[%s] [%s] %s\n", timestamp, level_name, msg);
+        fflush(s_log_file);
+    }
+    if (s_callback) s_callback((LogLevel)level, msg, s_callback_userdata);
+}
+
+static void *logq_thread(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&s_logq_lock);
+    for (;;) {
+        while (s_logq_count == 0 && !s_logq_stop) {
+            s_logq_busy = 0;
+            pthread_cond_broadcast(&s_logq_idle);
+            pthread_cond_wait(&s_logq_cond, &s_logq_lock);
+        }
+        if (s_logq_count == 0 && s_logq_stop) break;
+        LogQItem it = s_logq[s_logq_head];
+        s_logq[s_logq_head].text = NULL;
+        s_logq_head = (s_logq_head + 1) % LOGQ_CAP;
+        s_logq_count--;
+        unsigned long long dropped = s_logq_dropped - s_logq_reported_dropped;
+        s_logq_reported_dropped = s_logq_dropped;
+        s_logq_busy = 1;
+        pthread_mutex_unlock(&s_logq_lock);
+
+        if (dropped) {
+            char note[96];
+            snprintf(note, sizeof note, "log: %llu messages were dropped (the log queue was full)", dropped);
+            log_emit(LOG_WARN, it.ts, note);
+        }
+        log_emit(it.level, it.ts, it.text);
+        free(it.text);
+
+        pthread_mutex_lock(&s_logq_lock);
+    }
+    s_logq_busy = 0;
+    pthread_cond_broadcast(&s_logq_idle);
+    pthread_mutex_unlock(&s_logq_lock);
+    return NULL;
+}
+
+static void logq_start(void)
+{
+    if (s_logq_running) return;
+    if (getenv("RMMZ_LOG_SYNC")) return;
+#ifndef RMMZ_EMBEDDED
+    if (!getenv("RMMZ_LOG_ASYNC")) return;
+#endif
+    s_logq_stop = 0;
+    if (pthread_create(&s_logq_thread, NULL, logq_thread, NULL) == 0) {
+        s_logq_running = 1;
+        s_async = 1;
+    }
+}
+
+/* Waits (up to timeout_ms) until everything queued so far has been written. */
+void error_handler_flush(int timeout_ms)
+{
+    if (!s_logq_running) return;
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += timeout_ms / 1000;
+    dl.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&s_logq_lock);
+    while ((s_logq_count > 0 || s_logq_busy) &&
+           pthread_cond_timedwait(&s_logq_idle, &s_logq_lock, &dl) == 0) {
+    }
+    pthread_mutex_unlock(&s_logq_lock);
+}
+
+static void logq_stop(void)
+{
+    if (!s_logq_running) return;
+    error_handler_flush(10000);
+    s_async = 0;                       /* later messages are written by the caller */
+    pthread_mutex_lock(&s_logq_lock);
+    s_logq_stop = 1;
+    pthread_cond_broadcast(&s_logq_cond);
+    int pending = s_logq_count;
+    pthread_mutex_unlock(&s_logq_lock);
+    if (pending == 0) pthread_join(s_logq_thread, NULL);
+    else pthread_detach(s_logq_thread);   /* the sinks are stuck: do not hold the exit */
+    s_logq_running = 0;
+}
+
+/* true when the message was queued */
+static int logq_push(int level, const char *timestamp, const char *msg)
+{
+    char *copy = strdup(msg);
+    if (!copy) return 0;
+    pthread_mutex_lock(&s_logq_lock);
+    if (s_logq_count >= LOGQ_CAP) {
+        s_logq_dropped++;
+        pthread_mutex_unlock(&s_logq_lock);
+        free(copy);
+        return 1;
+    }
+    LogQItem *it = &s_logq[(s_logq_head + s_logq_count) % LOGQ_CAP];
+    it->text = copy;
+    it->level = level;
+    snprintf(it->ts, sizeof it->ts, "%s", timestamp);
+    s_logq_count++;
+    pthread_cond_signal(&s_logq_cond);
+    pthread_mutex_unlock(&s_logq_lock);
+    return 1;
+}
+#else
+void error_handler_flush(int timeout_ms) { (void)timeout_ms; }
+#endif
 
 void error_handler_init(const char *log_file_path, LogLevel min_level)
 {
@@ -35,11 +179,17 @@ void error_handler_init(const char *log_file_path, LogLevel min_level)
             fprintf(stderr, "[ERROR] Failed to open log file: %s\n", log_file_path);
         }
     }
+#ifdef RMMZ_LOG_THREAD
+    logq_start();
+#endif
 }
 
 void error_handler_shutdown(void)
 {
     compat_summary();
+#ifdef RMMZ_LOG_THREAD
+    logq_stop();
+#endif
     if (s_log_file) {
         fclose(s_log_file);
         s_log_file = NULL;
@@ -113,6 +263,9 @@ void error_handler_log(LogLevel level, const char *fmt, ...)
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
+#ifdef RMMZ_LOG_THREAD
+    if (s_async && logq_push((int)level, timestamp, msg)) return;
+#endif
     const char *level_name = error_handler_level_name(level);
 
     FILE *out = (level >= LOG_WARN) ? stderr : stdout;
