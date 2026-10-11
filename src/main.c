@@ -304,7 +304,11 @@ int main(int argc, char *argv[])
         error_handler_shutdown();
         return 1;
     }
+#ifdef RMMZ_JS_JSC
+    error_handler_log(LOG_INFO, "JavaScriptCore engine initialized");
+#else
     error_handler_log(LOG_INFO, "QuickJS engine initialized");
+#endif
     if (watchdog_ms > 0) {
         js_engine_set_watchdog(js, (unsigned)watchdog_ms);
         error_handler_log(LOG_INFO, "Script watchdog enabled: %d ms", watchdog_ms);
