@@ -10,6 +10,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* WTF calls memmem(), which the PS5's libc does not have. */
+__attribute__((weak)) void *memmem(const void *h, size_t hl, const void *n, size_t nl)
+{
+    if (nl == 0) return (void *)h;
+    if (hl < nl) return NULL;
+    const unsigned char *p = h, *q = n;
+    for (size_t i = 0; i + nl <= hl; i++)
+        if (p[i] == q[0] && memcmp(p + i, q, nl) == 0) return (void *)(p + i);
+    return NULL;
+}
+
 /* JSContextRefPrivate.h */
 extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 
@@ -458,7 +469,7 @@ int JS_ToInt32(JSContext *ctx, int32_t *pres, JSValueConst v)
     if (v.tag == JSV_INT) { *pres = v.u.i32; return 0; }
     double d;
     if (to_number(ctx, v, &d)) { *pres = 0; return -1; }
-    if (!isfinite(d)) { *pres = 0; return 0; }
+    if (!__builtin_isfinite(d)) { *pres = 0; return 0; }
     if (d >= -2147483648.0 && d <= 2147483647.0) { *pres = (int32_t)d; return 0; }
     double m = fmod(trunc(d), 4294967296.0);
     if (m < 0) m += 4294967296.0;
@@ -479,7 +490,7 @@ int JS_ToBool(JSContext *ctx, JSValueConst v)
     switch (v.tag) {
     case JSV_TRUE: return 1;
     case JSV_INT: return v.u.i32 != 0;
-    case JSV_FLOAT: return v.u.f64 != 0 && !isnan(v.u.f64);
+    case JSV_FLOAT: return v.u.f64 != 0 && !__builtin_isnan(v.u.f64);
     case JSV_REF: return JSValueToBoolean(ctx->g, v.u.ref);
     default: return 0;
     }
