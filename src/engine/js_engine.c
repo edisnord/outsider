@@ -485,7 +485,10 @@ static JSValue js_console_output(JSContext *ctx, JSValueConst this_val,
             }
         }
         key[k] = '\0';
-        compat_report(magic == 2 ? "console-error" : "console-warn", key, "%s", msg);
+        int has_letter = 0;
+        for (size_t i = 0; i < k; i++)
+            if ((key[i] >= 'a' && key[i] <= 'z') || (key[i] >= 'A' && key[i] <= 'Z')) { has_letter = 1; break; }
+        if (has_letter) compat_report(magic == 2 ? "console-error" : "console-warn", key, "%s", msg);
     }
 
     if (engine && engine->console_cb) {
