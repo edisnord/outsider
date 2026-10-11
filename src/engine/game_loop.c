@@ -695,6 +695,7 @@ bool game_loop_step(GameLoop *loop)
     loop->total_frames++;
     compat_set_frame((unsigned long long)loop->total_frames);
     if ((loop->total_frames & 127) == 0) compat_tick();
+    if ((loop->total_frames & 15) == 0) js_engine_profile_tick(loop->engine);
     if (ctx) autostart_step(loop, ctx);
     if (ctx) autoscript_step(loop, ctx);
     if (loop->max_frames > 0 && loop->total_frames >= loop->max_frames) {

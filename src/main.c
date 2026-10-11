@@ -297,6 +297,14 @@ int main(int argc, char *argv[])
 #endif
                       );
 
+#ifdef RMMZ_JS_JSC
+    if (profile_ms > 0) {
+        /* JSC reads the sampler's interval (microseconds) when the VM is created */
+        char us[16];
+        snprintf(us, sizeof us, "%d", profile_ms * 1000);
+        setenv("JSC_sampleInterval", us, 0);
+    }
+#endif
     JSEngine *js = js_engine_init();
     if (!js) {
         fatal_error("Failed to initialize JS engine");
@@ -432,6 +440,7 @@ int main(int argc, char *argv[])
         }
     }
     game_loop_run(loop);
+    js_engine_profile_flush(js);
 
     game_loop_destroy(loop);
     video_player_shutdown();

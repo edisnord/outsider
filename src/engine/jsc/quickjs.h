@@ -102,6 +102,11 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTrac
 void JS_SetModuleLoaderFunc2(JSRuntime *rt, void *normalize, JSModuleLoaderFunc2 *loader,
                              JSModuleCheckSupportedImportAttributes *check, void *opaque);
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
+
+/* Shim extension: JavaScriptCore's sampling profiler (see qjs_jsc.c). take() returns malloc'd JSON or NULL. */
+int rmmz_jsc_profiler_start(JSRuntime *rt);
+void rmmz_jsc_profiler_stop(JSRuntime *rt);
+char *rmmz_jsc_profiler_take(JSRuntime *rt, size_t *len);
 int JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 

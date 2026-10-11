@@ -51,6 +51,9 @@ __attribute__((weak)) time_t timegm(struct tm *tm)
 
 /* JSContextRefPrivate.h */
 extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
+extern bool JSContextGroupEnableSamplingProfiler(JSContextGroupRef group);
+extern void JSContextGroupDisableSamplingProfiler(JSContextGroupRef group);
+extern JSStringRef JSContextGroupTakeSamplesFromSamplingProfiler(JSContextGroupRef group);
 extern void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObjectRef function,
                                                          JSValueRef *exception);
 
@@ -366,6 +369,35 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTrac
     rt->rejection_opaque = opaque;
     for (int i = 0; i < MAX_CONTEXTS; i++)
         if (g_ctxs[i] && g_ctxs[i]->rt == rt) install_rejection_hook(g_ctxs[i]);
+}
+
+/* JSC's own sampling profiler (a thread that suspends the script thread and walks its stack, interval from
+   JSC_sampleInterval in microseconds, read when the first VM is created). It sees native frames too, so a stretch
+   inside drawImage or the collector is charged to that function and not to the next script line. */
+int rmmz_jsc_profiler_start(JSRuntime *rt)
+{
+    return rt && JSContextGroupEnableSamplingProfiler(rt->group) ? 1 : 0;
+}
+
+void rmmz_jsc_profiler_stop(JSRuntime *rt)
+{
+    if (rt) JSContextGroupDisableSamplingProfiler(rt->group);
+}
+
+/* The samples recorded since the last call, as the JSON JSC produces (malloc'd, NULL when there are none). */
+char *rmmz_jsc_profiler_take(JSRuntime *rt, size_t *len)
+{
+    if (!rt) return NULL;
+    JSStringRef js = JSContextGroupTakeSamplesFromSamplingProfiler(rt->group);
+    if (!js) return NULL;
+    size_t cap = JSStringGetMaximumUTF8CStringSize(js);
+    char *out = malloc(cap);
+    if (out) {
+        size_t n = JSStringGetUTF8CString(js, out, cap);
+        if (len) *len = n ? n - 1 : 0;
+    }
+    JSStringRelease(js);
+    return out;
 }
 
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)

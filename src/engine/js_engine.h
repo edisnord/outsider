@@ -61,6 +61,13 @@ void js_engine_set_watchdog(JSEngine *engine, unsigned limit_ms);
    0 disables (the default). */
 void js_engine_set_profile(JSEngine *engine, unsigned interval_ms);
 
+/* Called by the game loop every few frames. With JavaScriptCore the profile is taken from the engine's own sampler
+   here (QuickJS samples from its interrupt handler and ignores this): prints the report every 10 seconds. */
+void js_engine_profile_tick(JSEngine *engine);
+
+/* Print what has been sampled so far (the last, partial window); call before shutting down. */
+void js_engine_profile_flush(JSEngine *engine);
+
 /* Restart the watchdog clock. Eval entry points arm it themselves; the game
    loop arms it once per frame. */
 void js_engine_watchdog_arm(JSEngine *engine);

@@ -117,8 +117,8 @@ static int native_prof_cmp(const void *a, const void *b)
 
 static double prof_overhead_ms, prof_overhead_worst_ms;
 static unsigned prof_overhead_samples;
-static ProfEntry prof_tables[3][PROF_MAX];
-static int prof_counts[3];
+static ProfEntry prof_tables[5][PROF_MAX];
+static int prof_counts[5];
 #define prof_table prof_tables[0]
 #define prof_count prof_counts[0]
 
@@ -180,21 +180,22 @@ static int prof_cmp(const void *a, const void *b)
 
 static void prof_report(JSEngine *engine)
 {
-    static const char *titles[3] = {
-        "top script stacks", "time per file (innermost frame)", "time per function in game code (not shims)"
+    static const char *titles[5] = {
+        "top script stacks", "time per file (innermost frame)", "time per function in game code (not shims)",
+        "time inside native functions (innermost frame is native)", "time per execution tier (innermost frame)"
     };
-    static const int limits[3] = { 15, 15, 20 };
+    static const int limits[5] = { 15, 15, 20, 18, 8 };
     double total = engine->profile_total_ms > 0 ? engine->profile_total_ms : 1;
-    {
-        JSMemoryUsage mu;
-        JS_ComputeMemoryUsage(engine->rt, &mu);
+    JSMemoryUsage mu;
+    JS_ComputeMemoryUsage(engine->rt, &mu);
+    if (mu.malloc_size > 0) {
         error_handler_log(LOG_INFO, "[profile] heap: %.1f MB in %lld blocks; %lld objects, %lld strings, %lld atoms, %lld shapes, "
                 "%lld js functions, %lld arrays (%lld fast)",
                 mu.malloc_size / 1048576.0, (long long)mu.malloc_count, (long long)mu.obj_count,
                 (long long)mu.str_count, (long long)mu.atom_count, (long long)mu.shape_count,
                 (long long)mu.js_func_count, (long long)mu.array_count, (long long)mu.fast_array_count);
     }
-    for (int t = 0; t < 3; t++) {
+    for (int t = 0; t < 5; t++) {
         if (prof_counts[t] == 0) continue;
         qsort(prof_tables[t], (size_t)prof_counts[t], sizeof(ProfEntry), prof_cmp);
         error_handler_log(LOG_INFO, "[profile] ---- %s over the last %.1f s (charged time, ms) ----",
@@ -362,6 +363,269 @@ void js_engine_set_watchdog(JSEngine *engine, unsigned limit_ms)
     JS_SetInterruptHandler(engine->rt, (limit_ms || engine->profile_ms) ? watchdog_interrupt : NULL, engine);
 }
 
+
+#ifdef RMMZ_JS_JSC
+/* ---- JavaScriptCore: the profile comes from the engine's own sampler ---------------------------------
+   JSC has no interrupt handler to hang a sampler on, but it has a sampling profiler thread that suspends the script
+   thread on a timer and records its stack, native frames included. js_engine_profile_tick() collects its JSON every
+   10 s and feeds the same tables as the QuickJS sampler, plus two it can fill that QuickJS cannot: time whose
+   innermost frame is a native function (a stall inside drawImage is charged to drawImage, not to the next script
+   line) and time per execution tier (LLInt / Baseline / DFG / FTL). Every sample is charged one interval. */
+
+typedef struct { double id; char url[200]; } JscSource;
+
+static const char *jp_ws(const char *p) { while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++; return p; }
+
+/* a JSON string at p (on the opening quote) -> out (truncated), returns the position after the closing quote */
+static const char *jp_string(const char *p, char *out, size_t cap)
+{
+    size_t o = 0;
+    if (*p != '"') { if (out && cap) out[0] = '\0'; return p; }
+    p++;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\' && *p) {
+            char e = *p++;
+            if (e == 'n') c = ' ';
+            else if (e == 'u') { for (int i = 0; i < 4 && *p; i++) p++; c = '?'; }
+            else c = e;
+        }
+        if (out && o + 1 < cap) out[o++] = c;
+    }
+    if (out && cap) out[o] = '\0';
+    return *p == '"' ? p + 1 : p;
+}
+
+/* skips one JSON value of any kind */
+static const char *jp_skip(const char *p)
+{
+    p = jp_ws(p);
+    if (*p == '"') return jp_string(p, NULL, 0);
+    if (*p == '{' || *p == '[') {
+        char open = *p, close = open == '{' ? '}' : ']';
+        int depth = 0;
+        for (; *p; p++) {
+            if (*p == '"') { p = jp_string(p, NULL, 0) - 1; continue; }
+            if (*p == open) depth++;
+            else if (*p == close && --depth == 0) return p + 1;
+        }
+        return p;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']') p++;
+    return p;
+}
+
+static void jp_basename(const char *url, char *out, size_t cap)
+{
+    const char *b = strrchr(url, '/');
+    snprintf(out, cap, "%s", b ? b + 1 : url);
+}
+
+typedef struct {
+    char   name[96];
+    char   url[200];
+    char   category[16];
+    double line;
+    int    native;
+} JscFrame;
+
+/* parse one frame object at p ('{'); returns the position after it */
+static const char *jp_frame(const char *p, JscFrame *f, const JscSource *src, int nsrc)
+{
+    memset(f, 0, sizeof *f);
+    double id = 0;
+    p = jp_ws(p) + 1;
+    while (*p && *p != '}') {
+        p = jp_ws(p);
+        if (*p == ',') { p++; continue; }
+        char key[24];
+        p = jp_string(p, key, sizeof key);
+        p = jp_ws(p);
+        if (*p == ':') p++;
+        p = jp_ws(p);
+        if (strcmp(key, "name") == 0) p = jp_string(p, f->name, sizeof f->name);
+        else if (strcmp(key, "category") == 0) p = jp_string(p, f->category, sizeof f->category);
+        else if (strcmp(key, "sourceID") == 0) { id = atof(p); p = jp_skip(p); }
+        else if (strcmp(key, "line") == 0) { f->line = atof(p); p = jp_skip(p); }
+        else p = jp_skip(p);
+    }
+    for (int i = 0; i < nsrc; i++)
+        if (src[i].id == id) { snprintf(f->url, sizeof f->url, "%s", src[i].url); break; }
+    f->native = f->url[0] == '\0';
+    if (!f->name[0]) snprintf(f->name, sizeof f->name, "(anonymous)");
+    return *p == '}' ? p + 1 : p;
+}
+
+static void jsc_profile_consume(JSEngine *engine, const char *json, double wall_s)
+{
+    static JscSource sources[512];
+    int nsrc = 0;
+    /* "sources" follows "traces" in the output, and traces need it: read it first (search from the end) */
+    const char *sp = NULL;
+    for (const char *q = json; (q = strstr(q, "\"sources\":")) != NULL; q++) sp = q;
+    if (sp) {
+        const char *p = jp_ws(sp + 10);
+        if (*p == '[') {
+            p++;
+            while (*p && *p != ']' && nsrc < 512) {
+                p = jp_ws(p);
+                if (*p == ',') { p++; continue; }
+                if (*p != '{') break;
+                p++;
+                JscSource *s = &sources[nsrc];
+                s->id = -1;
+                s->url[0] = '\0';
+                while (*p && *p != '}') {
+                    p = jp_ws(p);
+                    if (*p == ',') { p++; continue; }
+                    char key[24];
+                    p = jp_string(p, key, sizeof key);
+                    p = jp_ws(p);
+                    if (*p == ':') p++;
+                    p = jp_ws(p);
+                    if (strcmp(key, "sourceID") == 0) { s->id = atof(p); p = jp_skip(p); }
+                    else if (strcmp(key, "url") == 0) p = jp_string(p, s->url, sizeof s->url);
+                    else p = jp_skip(p);
+                }
+                if (*p == '}') p++;
+                if (s->id >= 0) nsrc++;
+            }
+        }
+    }
+
+    double interval_ms = 1.0;
+    const char *ip = strstr(json, "\"interval\":");
+    if (ip) interval_ms = atof(ip + 11) * 1000.0;
+    if (interval_ms <= 0) interval_ms = 1.0;
+
+    const char *p = strstr(json, "\"traces\":");
+    if (!p) return;
+    p = jp_ws(p + 9);
+    if (*p != '[') return;
+    p++;
+    unsigned traces = 0;
+    while (*p && *p != ']') {
+        p = jp_ws(p);
+        if (*p == ',') { p++; continue; }
+        if (*p != '{') break;
+        p++;                                   /* into the trace object */
+        JscFrame fr[3];
+        int nfr = 0;
+        JscFrame first_game, innermost_file;
+        int have_game = 0, have_file = 0;
+        while (*p && *p != '}') {
+            p = jp_ws(p);
+            if (*p == ',') { p++; continue; }
+            char key[24];
+            p = jp_string(p, key, sizeof key);
+            p = jp_ws(p);
+            if (*p == ':') p++;
+            p = jp_ws(p);
+            if (strcmp(key, "frames") == 0 && *p == '[') {
+                p++;
+                while (*p && *p != ']') {
+                    p = jp_ws(p);
+                    if (*p == ',') { p++; continue; }
+                    if (*p != '{') break;
+                    JscFrame f;
+                    p = jp_frame(p, &f, sources, nsrc);
+                    if (nfr < 3) fr[nfr++] = f;
+                    if (!f.native && !have_file) { innermost_file = f; have_file = 1; }
+                    if (!f.native && !have_game && !strstr(f.url, "shims/")) { first_game = f; have_game = 1; }
+                }
+                if (*p == ']') p++;
+            } else {
+                p = jp_skip(p);
+            }
+        }
+        if (*p == '}') p++;
+        traces++;
+        if (nfr == 0) continue;
+
+        char key[PROF_KEY], part[260];
+        key[0] = '\0';
+        for (int i = 0; i < nfr; i++) {
+            char base[100];
+            if (fr[i].native) snprintf(part, sizeof part, "%s%s(native)", i ? " < " : "", fr[i].name);
+            else {
+                jp_basename(fr[i].url, base, sizeof base);
+                snprintf(part, sizeof part, "%s%s(%s:%d)", i ? " < " : "", fr[i].name, base, (int)fr[i].line);
+            }
+            if (strlen(key) + strlen(part) + 1 < sizeof key) strcat(key, part);
+        }
+        prof_add(0, key, interval_ms);
+        if (have_file) {
+            char base[100];
+            jp_basename(innermost_file.url, base, sizeof base);
+            prof_add(1, base, interval_ms);
+        } else {
+            prof_add(1, "(native / no file)", interval_ms);
+        }
+        if (have_game) {
+            char base[100], gk[PROF_KEY];
+            jp_basename(first_game.url, base, sizeof base);
+            snprintf(gk, sizeof gk, "%s (%s)", first_game.name, base);
+            prof_add(2, gk, interval_ms);
+        } else {
+            prof_add(2, "(shims / native only)", interval_ms);
+        }
+        if (fr[0].native) prof_add(3, fr[0].name, interval_ms);
+        prof_add(4, fr[0].native ? "native" : (fr[0].category[0] ? fr[0].category : "?"), interval_ms);
+        engine->profile_total_ms += interval_ms;
+    }
+    (void)wall_s;
+    (void)traces;
+}
+
+static void jsc_profile_report(JSEngine *engine, int final)
+{
+    uint64_t t0 = monotonic_us();
+    size_t len = 0;
+    char *json = rmmz_jsc_profiler_take(engine->rt, &len);
+    uint64_t t1 = monotonic_us();
+    double wall_s = engine->profile_report_us ? (double)(t1 - engine->profile_report_us) / 1e6 : 0;
+    if (json) {
+        jsc_profile_consume(engine, json, wall_s);
+        free(json);
+    }
+    uint64_t t2 = monotonic_us();
+    if (engine->profile_total_ms > 0) {
+        error_handler_log(LOG_INFO, "[profile] %s%.1f s of wall time, %.1f s sampled (JavaScriptCore sampler, %u ms)",
+                          final ? "final window: " : "window: ", wall_s, engine->profile_total_ms / 1000.0,
+                          engine->profile_ms);
+        prof_report(engine);
+    } else if (final) {
+        prof_report(engine);       /* natives timed, no samples */
+    }
+    uint64_t t3 = monotonic_us();
+    error_handler_log(LOG_INFO, "[profile] overhead of profiling in this window: taking the samples %.0f ms (%zu bytes), "
+                      "reading them %.0f ms, printing the report %.0f ms",
+                      (double)(t1 - t0) / 1000.0, len, (double)(t2 - t1) / 1000.0, (double)(t3 - t2) / 1000.0);
+    engine->profile_report_us = monotonic_us();
+}
+
+void js_engine_profile_tick(JSEngine *engine)
+{
+    if (!engine || !engine->profile_ms) return;
+    uint64_t now = monotonic_us();
+    if (engine->profile_report_us == 0) {
+        engine->profile_report_us = now;
+        return;
+    }
+    if (now - engine->profile_report_us < 10000000u) return;
+    jsc_profile_report(engine, 0);
+}
+
+void js_engine_profile_flush(JSEngine *engine)
+{
+    if (!engine || !engine->profile_ms || engine->profile_report_us == 0) return;
+    jsc_profile_report(engine, 1);
+}
+#else
+void js_engine_profile_tick(JSEngine *engine) { (void)engine; }
+void js_engine_profile_flush(JSEngine *engine) { (void)engine; }
+#endif
+
 /* Stall watchdog (with --profile): the sampler above only runs between bytecode instructions, so a long stretch inside
    native code shows up as a single sample charged to whatever ran next. This thread notices that the script thread has
    not reached the sampler for a while and says which native scopes (RMMZ_PROF_SCOPE) it is inside. Scopes that are
@@ -414,6 +678,14 @@ void js_engine_set_profile(JSEngine *engine, unsigned interval_ms)
     engine->profile_ms = interval_ms;
     rmmz_prof_enabled = interval_ms > 0;
     engine->profile_last_us = 0;
+#ifdef RMMZ_JS_JSC
+    if (interval_ms) {
+        if (rmmz_jsc_profiler_start(engine->rt))
+            error_handler_log(LOG_INFO, "JavaScriptCore sampling profiler started");
+        else
+            error_handler_log(LOG_WARN, "JavaScriptCore sampling profiler is not available in this build");
+    }
+#endif
     JS_SetInterruptHandler(engine->rt, (interval_ms || engine->watchdog_ms) ? watchdog_interrupt : NULL, engine);
 }
 
