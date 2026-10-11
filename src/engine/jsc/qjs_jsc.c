@@ -277,18 +277,23 @@ JSContext *JS_NewContext(JSRuntime *rt)
     }
     static int self_tested;
     if (!self_tested) {
-        /* Says in the log whether the JIT is running: about 10 ms with it, 100 ms or more without. */
+        /* Three timed runs of the same function, to tell the tiers apart in the log: the first runs in the
+           interpreter and pays for compiling, later ones are fast only if the JIT is working (fib(27):
+           about 35 ms in the interpreter, a few ms compiled). */
         self_tested = 1;
         static const char src[] = "(function f(n){return n<2?n:f(n-1)+f(n-2)})(27)";
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        JSStringRef js = JSStringCreateWithUTF8CString(src);
-        JSValueRef r = JSEvaluateScript(ctx->g, js, NULL, NULL, 1, NULL);
-        JSStringRelease(js);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        fprintf(stderr, "jsc: self-test fib(27) = %.0f took %.1f ms (JIT %s)\n", r ? JSValueToNumber(ctx->g, r, NULL) : -1.0,
-                (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
-                (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 < 40 ? "on" : "probably off");
+        double ms[3];
+        for (int i = 0; i < 3; i++) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            JSStringRef js = JSStringCreateWithUTF8CString(src);
+            JSEvaluateScript(ctx->g, js, NULL, NULL, 1, NULL);
+            JSStringRelease(js);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            ms[i] = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        }
+        fprintf(stderr, "jsc: self-test fib(27) runs: %.1f / %.1f / %.1f ms (a few ms on the last = JIT on)\n",
+                ms[0], ms[1], ms[2]);
     }
     return ctx;
 }
