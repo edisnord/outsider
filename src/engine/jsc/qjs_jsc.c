@@ -191,6 +191,9 @@ JSRuntime *JS_NewRuntime(void)
     setenv("JSC_useConcurrentGC", "0", 0);
     setenv("JSC_useConcurrentJIT", "0", 0);
     setenv("JSC_numberOfGCMarkers", "1", 0);
+    /* with RMMZ_JSC_DUMP_OPTIONS set JSC prints every option's final value (useJIT shows whether the JIT was
+       switched off) to stderr when the VM is created */
+    if (getenv("RMMZ_JSC_DUMP_OPTIONS")) setenv("JSC_dumpOptions", "2", 0);
     JSRuntime *rt = calloc(1, sizeof *rt);
     if (!rt) return NULL;
     rt->group = JSContextGroupCreate();
