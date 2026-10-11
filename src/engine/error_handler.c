@@ -392,7 +392,7 @@ static int compat_cmp(const void *a, const void *b)
     return strcmp(x->key, y->key);
 }
 
-void compat_summary(void)
+static void compat_print(int limit)
 {
     if (s_compat_lock) SDL_LockMutex(s_compat_lock);
     int n = 0;
@@ -408,13 +408,20 @@ void compat_summary(void)
 
     error_handler_log(LOG_WARN, "[compat] ---- summary at %.0f s, frame %llu: %d distinct, %llu total%s ----", now,
                       s_compat_frame, n, total, overflow ? " (table was full)" : "");
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && (limit <= 0 || i < limit); i++) {
         const CompatEntry *e = list[i];
         error_handler_log(LOG_WARN, "[compat] %8llux %-13s %s%s%s (first t=%.1fs frame %llu)", e->count, e->cat, e->key,
                           e->detail[0] && strcmp(e->detail, e->key) != 0 ? " -- " : "",
                           e->detail[0] && strcmp(e->detail, e->key) != 0 ? e->detail : "", e->first_s, e->first_frame);
     }
+    if (limit > 0 && n > limit)
+        error_handler_log(LOG_WARN, "[compat] ... and %d more entries (the full table is printed at shutdown)", n - limit);
     if (s_compat_lock) SDL_UnlockMutex(s_compat_lock);
+}
+
+void compat_summary(void)
+{
+    compat_print(0);
 }
 
 void compat_tick(void)
