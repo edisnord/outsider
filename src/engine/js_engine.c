@@ -5,7 +5,9 @@
 
 #include "engine/js_engine.h"
 #include "engine/error_handler.h"
+#ifndef RMMZ_JS_JSC
 #include "engine/js_pool_alloc.h"
+#endif
 
 #include <quickjs.h>
 #include <quickjs-libc.h>
@@ -636,7 +638,7 @@ static void flush_unhandled_rejections(JSEngine *engine)
 
 JSEngine *js_engine_init(void)
 {
-#ifdef RMMZ_PS5
+#if defined(RMMZ_PS5) && !defined(RMMZ_JS_JSC)
     /* The console's malloc is several times slower than a PC's for the small, short-lived blocks QuickJS
        allocates all the time (see js_pool_alloc.h). RMMZ_SYSTEM_MALLOC=1 switches back, for comparison. */
     const char *sys_malloc = getenv("RMMZ_SYSTEM_MALLOC");
@@ -846,6 +848,10 @@ static bool write_file_binary(const char *path, const uint8_t *data, size_t size
 bool js_engine_eval_file_cached(JSEngine *engine, const char *filepath)
 {
     if (!engine || !filepath) return false;
+#ifdef RMMZ_JS_JSC
+    /* JavaScriptCore's C API cannot serialise bytecode. */
+    return js_engine_eval_file(engine, filepath);
+#endif
 
     char *cache_path = make_cache_path(filepath);
     if (!cache_path) return js_engine_eval_file(engine, filepath);

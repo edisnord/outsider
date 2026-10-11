@@ -24,6 +24,15 @@ set_target_properties(SDL3::SDL3 PROPERTIES
     IMPORTED_LOCATION ${RMMZ_PS5_SDL3_PREFIX}/lib/libSDL3.a
     INTERFACE_INCLUDE_DIRECTORIES ${RMMZ_PS5_SDL3_PREFIX}/include)
 
+# RMMZ_JS_ENGINE=jsc: JavaScriptCore (JIT) instead of QuickJS-NG. src/engine/jsc/quickjs.h implements the
+# QuickJS API Outsider uses on JSC's C API, so the bindings are unchanged. RMMZ_JSC_HEADERS is the
+# JavaScriptCore/Headers directory of a JSCOnly build; the final link adds JSC itself (title-link.sh).
+set(RMMZ_JS_ENGINE "quickjs" CACHE STRING "JavaScript engine: quickjs or jsc")
+set(RMMZ_JSC_HEADERS "" CACHE PATH "JavaScriptCore/Headers of the JSCOnly build (RMMZ_JS_ENGINE=jsc)")
+if(RMMZ_JS_ENGINE STREQUAL "jsc" AND NOT RMMZ_JSC_HEADERS)
+    message(FATAL_ERROR "RMMZ_JS_ENGINE=jsc needs RMMZ_JSC_HEADERS")
+endif()
+
 add_library(qjs STATIC IMPORTED)
 set_target_properties(qjs PROPERTIES
     IMPORTED_LOCATION ${RMMZ_PS5_PREFIX}/lib/libqjs.a
@@ -123,4 +132,13 @@ if(EXISTS ${RMMZ_PS5_PREFIX}/lib/libavformat.a AND EXISTS ${RMMZ_PS5_PREFIX}/inc
     target_compile_definitions(outsider PRIVATE RMMZ_HAVE_FFMPEG)
     target_include_directories(outsider PRIVATE ${RMMZ_PS5_PREFIX}/include)
 endif()
-target_link_libraries(outsider PRIVATE SDL3::SDL3 qjs soloud)
+if(RMMZ_JS_ENGINE STREQUAL "jsc")
+    target_sources(outsider PRIVATE src/engine/jsc/qjs_jsc.c)
+    # before everything else: the SDK prefix has a quickjs.h of its own
+    target_include_directories(outsider BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/jsc ${RMMZ_JSC_HEADERS})
+    target_compile_definitions(outsider PRIVATE RMMZ_JS_JSC)
+    target_link_libraries(outsider PRIVATE SDL3::SDL3 soloud)
+else()
+    target_link_libraries(outsider PRIVATE SDL3::SDL3 qjs soloud)
+endif()
