@@ -21,6 +21,34 @@ __attribute__((weak)) void *memmem(const void *h, size_t hl, const void *n, size
     return NULL;
 }
 
+/* ... and mkostemp() and timegm(), which the title's libc lacks as well */
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
+__attribute__((weak)) int mkostemp(char *tmpl, int flags)
+{
+    int fd = mkstemp(tmpl);
+    if (fd >= 0 && (flags & O_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
+__attribute__((weak)) time_t timegm(struct tm *tm)
+{
+    /* days from civil (H. Hinnant), normalising the month first */
+    long long y = tm->tm_year + 1900LL, m = tm->tm_mon;
+    y += m / 12;
+    m %= 12;
+    if (m < 0) { m += 12; y--; }
+    long long mm = m + 1;
+    y -= mm <= 2;
+    long long era = (y >= 0 ? y : y - 399) / 400;
+    long long yoe = y - era * 400;
+    long long doy = (153 * (mm + (mm > 2 ? -3 : 9)) + 2) / 5 + tm->tm_mday - 1;
+    long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long long days = era * 146097 + doe - 719468;
+    return (time_t)(days * 86400 + tm->tm_hour * 3600LL + tm->tm_min * 60LL + tm->tm_sec);
+}
+
 /* JSContextRefPrivate.h */
 extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 
