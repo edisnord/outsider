@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "engine/error_handler.h"
 
 /* Reject plugin names containing path separators or traversal. */
 /* Plugin names are paths under js/plugins/ and may use subfolders
@@ -570,6 +571,8 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
                     printf("script_loader: plugin %s\n", plugins->entries[i].name);
                     bool ok = deobf_eval_plugin_file(engine, path, shim_dir);
                     if (!ok) {
+                        compat_report("plugin", plugins->entries[i].name, "failed to load: its script threw "
+                                      "(the exception is in the lines above)");
                         fprintf(stderr, "script_loader: warning: plugin error: %s\n",
                                 plugins->entries[i].name);
                     }
@@ -578,6 +581,7 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
                     js_engine_eval(engine, "__dom_setCurrentScript(null);",
                                    "<clear-current-script>");
                 } else {
+                    compat_report("plugin", path, "listed in plugins.js but the file does not exist");
                     fprintf(stderr, "script_loader: warning: plugin not found: %s\n", path);
                 }
                 free(path);

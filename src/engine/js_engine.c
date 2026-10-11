@@ -545,12 +545,49 @@ static void js_register_console(JSContext *ctx)
     JS_FreeValue(ctx, global);
 }
 
+/* One compatibility-log entry per kind of error and throw site: the message with digit runs folded, plus the first
+   stack frame that names a source position (engine formats differ: "at f (file:12)" / "f@file:12:3"). */
+static void compat_report_exception(const char *category, const char *msg, const char *stack)
+{
+    char key[240];
+    size_t k = 0;
+    for (const char *p = msg ? msg : ""; *p && k < 100; p++) {
+        if (*p >= '0' && *p <= '9') {
+            if (k == 0 || key[k - 1] != '#') key[k++] = '#';
+        } else {
+            key[k++] = (*p == '\n' || *p == '\r') ? ' ' : *p;
+        }
+    }
+    const char *frame = NULL;
+    size_t frame_len = 0;
+    for (const char *line = stack; line && *line;) {
+        const char *eol = strchr(line, '\n');
+        size_t len = eol ? (size_t)(eol - line) : strlen(line);
+        while (len && (*line == ' ' || *line == '\t')) { line++; len--; }
+        int has_pos = 0;
+        for (size_t i = 0; i + 1 < len; i++)
+            if (line[i] == ':' && line[i + 1] >= '0' && line[i + 1] <= '9') { has_pos = 1; break; }
+        int native = 0;
+        for (size_t i = 0; i + 13 <= len; i++)
+            if (strncmp(line + i, "[native code]", 13) == 0) { native = 1; break; }
+        if (has_pos && !native) { frame = line; frame_len = len; break; }
+        if (!eol) break;
+        line = eol + 1;
+    }
+    if (frame_len > 110) frame_len = 110;
+    k += (size_t)snprintf(key + k, sizeof(key) - k, " @ %.*s", frame ? (int)frame_len : 1, frame ? frame : "?");
+    compat_report(category, key, "%s", msg ? msg : "");
+}
+
 /* Print the pending exception and stack to stderr, or to the console callback. */
 static void js_dump_exception(JSEngine *engine, JSContext *ctx)
 {
     JSValue exc = JS_GetException(ctx);
 
     const char *str = JS_ToCString(ctx, exc);
+    char msg_copy[256];
+    snprintf(msg_copy, sizeof(msg_copy), "%s", str ? str : "");
+    int reported = 0;
     if (str) {
         if (engine && engine->console_cb) {
             engine->console_cb("error", str, engine->console_userdata);
@@ -565,6 +602,8 @@ static void js_dump_exception(JSEngine *engine, JSContext *ctx)
         if (!JS_IsUndefined(stack)) {
             const char *stack_str = JS_ToCString(ctx, stack);
             if (stack_str) {
+                compat_report_exception("exception", msg_copy, stack_str);
+                reported = 1;
                 if (engine && engine->console_cb) {
                     engine->console_cb("error", stack_str, engine->console_userdata);
                 } else {
@@ -575,6 +614,7 @@ static void js_dump_exception(JSEngine *engine, JSContext *ctx)
         }
         JS_FreeValue(ctx, stack);
     }
+    if (!reported) compat_report_exception("exception", msg_copy, NULL);
 
     JS_FreeValue(ctx, exc);
 }
