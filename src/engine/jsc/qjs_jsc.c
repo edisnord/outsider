@@ -582,7 +582,6 @@ static JSValue new_function(JSContext *ctx, JSCFunction *fn, JSCFunctionMagic *m
     d->mfn = mfn;
     d->magic = magic;
     JSObjectRef f = JSObjectMake(ctx->g, ctx->rt->func_class, d);
-    if (ctx->func_proto) JSObjectSetPrototype(ctx->g, f, ctx->func_proto);
     JSValue v = from_ref(ctx, f);
     if (name) {
         JSStringRef n = JSStringCreateWithUTF8CString("name");
@@ -596,6 +595,8 @@ static JSValue new_function(JSContext *ctx, JSCFunction *fn, JSCFunctionMagic *m
     JSObjectSetProperty(ctx->g, f, ln, JSValueMakeNumber(ctx->g, length),
                         kJSPropertyAttributeReadOnly | kJSPropertyAttributeDontEnum, NULL);
     JSStringRelease(ln);
+    /* last: Function.prototype's read-only name and length would make the sets above fail silently */
+    if (ctx->func_proto) JSObjectSetPrototype(ctx->g, f, ctx->func_proto);
     return v;
 }
 
