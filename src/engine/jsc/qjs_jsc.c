@@ -185,6 +185,12 @@ static JSStringRef str_len(const char *s, size_t len)
 
 JSRuntime *JS_NewRuntime(void)
 {
+    /* Concurrent GC and JIT crashed once on the console (docs/jsc.md) and were
+       slower in the benchmark; single-threaded is the default until that is understood. JSC reads these
+       when the first VM is created; anything already in the environment wins. */
+    setenv("JSC_useConcurrentGC", "0", 0);
+    setenv("JSC_useConcurrentJIT", "0", 0);
+    setenv("JSC_numberOfGCMarkers", "1", 0);
     JSRuntime *rt = calloc(1, sizeof *rt);
     if (!rt) return NULL;
     rt->group = JSContextGroupCreate();
