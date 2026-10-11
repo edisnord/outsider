@@ -127,11 +127,14 @@
         var wt = this.worldTransform;
         var ox = wt ? wt.tx : 0;
         var oy = wt ? wt.ty : 0;
+        /* the layer may sit inside a scaled container (map zoom): tiles are scaled with it */
+        var sx = wt && wt.a ? wt.a : 1;
+        var sy = wt && wt.d ? wt.d : 1;
 
         __native_tilemap.drawTiles(
             buf.buffer, numElements,
             texIds, texWidths, texHeights, numTs,
-            ox, oy
+            ox, oy, sx, sy
         );
     };
 
@@ -236,7 +239,8 @@
             if (bitmap._baseTexture && bitmap._baseTexture._glTexture &&
                 !bitmap._baseTexture._glTextureIsImageOwned &&
                 typeof __native_renderer !== "undefined") {
-                __native_renderer.deleteTexture(bitmap._baseTexture._glTexture);
+                if (typeof __dropGlTexture === "function") __dropGlTexture(bitmap._baseTexture);
+                else __native_renderer.deleteTexture(bitmap._baseTexture._glTexture);
                 bitmap._baseTexture._glTexture = 0;
             }
         };

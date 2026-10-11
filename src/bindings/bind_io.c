@@ -5,6 +5,7 @@
 
 #include "bindings/bind_io.h"
 #include "io/file_io.h"
+#include "stb_image.h" /* its zlib decoder: Node's zlib.inflate* for plugins */
 
 #include <quickjs.h>
 #include <stdlib.h>
@@ -257,6 +258,54 @@ static JSValue js_resolve_path(JSContext *ctx, JSValueConst this_val,
     return JS_NewString(ctx, resolved);
 }
 
+/* inflate(data, mode) -> ArrayBuffer. mode: 0 zlib, 1 raw deflate, 2 gzip, 3 zlib or gzip (by its header).
+   Used by the Node.js zlib shim (zlib.inflateSync, gunzipSync, ...). */
+static JSValue js_inflate(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "inflate requires data");
+
+    size_t size = 0;
+    uint8_t *in = JS_GetArrayBuffer(ctx, &size, argv[0]);
+    if (!in) return JS_EXCEPTION;
+
+    int mode = 3;
+    if (argc > 1) JS_ToInt32(ctx, &mode, argv[1]);
+
+    const uint8_t *p = in;
+    size_t n = size;
+    int header = mode == 1 ? 0 : 1;
+
+    if (mode == 2 || (mode == 3 && n >= 2 && p[0] == 0x1f && p[1] == 0x8b)) {
+        if (n < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8) {
+            return JS_ThrowInternalError(ctx, "incorrect header check");
+        }
+        size_t pos = 10;
+        int flg = p[3];
+        if (flg & 4) {
+            if (pos + 2 > n) return JS_ThrowInternalError(ctx, "unexpected end of file");
+            pos += 2 + (size_t)(p[pos] | (p[pos + 1] << 8));
+        }
+        if (flg & 8) { while (pos < n && p[pos]) pos++; pos++; }
+        if (flg & 16) { while (pos < n && p[pos]) pos++; pos++; }
+        if (flg & 2) pos += 2;
+        if (pos >= n) return JS_ThrowInternalError(ctx, "unexpected end of file");
+        p += pos;
+        n -= pos;
+        header = 0;
+    }
+
+    int outlen = 0;
+    char *dec = stbi_zlib_decode_malloc_guesssize_headerflag(
+        (const char *)p, (int)n, (int)(n * 4 + 64), &outlen, header);
+    if (!dec) return JS_ThrowInternalError(ctx, "incorrect header check");
+
+    JSValue result = JS_NewArrayBufferCopy(ctx, (const uint8_t *)dec, (size_t)outlen);
+    free(dec);
+    return result;
+}
+
 /* Registration */
 
 static const JSCFunctionListEntry js_io_funcs[] = {
@@ -272,6 +321,7 @@ static const JSCFunctionListEntry js_io_funcs[] = {
     JS_CFUNC_DEF("renameSync",      2, js_rename_sync),
     JS_CFUNC_DEF("getGameRoot",     0, js_get_game_root),
     JS_CFUNC_DEF("resolvePath",     1, js_resolve_path),
+    JS_CFUNC_DEF("inflate",         2, js_inflate),
 };
 
 void bind_io_register(JSContext *ctx)

@@ -15,7 +15,7 @@
 
     var _colorCache = {};
     var _colorCacheSize = 0;
-    var _colorCacheMax = 512;
+    var _colorCacheMax = 4096;
 
     var _namedColors = {
         "black":   [0,0,0,255],       "white":   [255,255,255,255],
@@ -36,21 +36,52 @@
         if (!str) return [0, 0, 0, 255];
         if (typeof str !== "string") return [0, 0, 0, 255];
 
+        return _parseColorShared(str).slice();
+    }
+
+    /* Like parseColor but returns the cached array itself: callers must not modify it. */
+    function _parseColorShared(str) {
+        if (!str) return [0, 0, 0, 255];
+        if (typeof str !== "string") return [0, 0, 0, 255];
+
         var cached = _colorCache[str];
-        if (cached) return cached.slice();
+        if (cached) return cached;
 
         var result = _parseColorUncached(str);
-        if (_colorCacheSize < _colorCacheMax) {
-            _colorCache[str] = result;
-            _colorCacheSize++;
+        if (_colorCacheSize >= _colorCacheMax) {
+            /* Lighting plugins generate thousands of distinct rgba() strings; start over rather than
+               stop caching. */
+            _colorCache = {};
+            _colorCacheSize = 0;
         }
-        return result.slice();
+        _colorCache[str] = result;
+        _colorCacheSize++;
+        return result;
     }
 
     function _parseColorUncached(str) {
         str = str.trim().toLowerCase();
 
         if (_namedColors[str]) return _namedColors[str];
+
+        /* Fast paths for the common forms, without regular expressions (they are slow to run here). */
+        var len = str.length, c0 = str.charCodeAt(0);
+        if (c0 === 35 && (len === 7 || len === 9)) {
+            var hr = parseInt(str.substr(1, 2), 16), hg = parseInt(str.substr(3, 2), 16);
+            var hb = parseInt(str.substr(5, 2), 16), ha = len === 9 ? parseInt(str.substr(7, 2), 16) : 255;
+            if (hr === hr && hg === hg && hb === hb && ha === ha) return [hr, hg, hb, ha];
+        } else if (c0 === 114 && str.charCodeAt(1) === 103 && str.charCodeAt(2) === 98 &&
+                   str.charCodeAt(len - 1) === 41) {
+            var lp = str.indexOf("(");
+            if (lp > 0) {
+                var parts = str.substring(lp + 1, len - 1).split(",");
+                if (parts.length === 3 || parts.length === 4) {
+                    var fr = parseInt(parts[0], 10), fg = parseInt(parts[1], 10), fb = parseInt(parts[2], 10);
+                    var fa = parts.length === 4 ? Math.round(parseFloat(parts[3]) * 255) : 255;
+                    if (fr === fr && fg === fg && fb === fb && fa === fa) return [fr, fg, fb, fa];
+                }
+            }
+        }
 
         var m = str.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/);
         if (m) {
@@ -132,6 +163,8 @@
         "xor":         10,
         "multiply":    11,
         "screen":      12,
+        "difference":  13,
+        "saturation":  14,
     };
 
     var _textAligns = {
@@ -188,6 +221,8 @@
             var w = this.canvas._width || 1;
             var h = this.canvas._height || 1;
             this._handle = __native_canvas2d.create(w, h);
+            /* frees the native canvas when this context is garbage collected */
+            if (this._handle && __native_canvas2d.createToken) this._token = __native_canvas2d.createToken(this._handle);
         }
     };
 
@@ -392,8 +427,25 @@
             if (m) fontSize = parseInt(m[1]);
             return { width: (text || "").length * fontSize * 0.6 };
         }
-        var w = __native_canvas2d.measureText(this._handle, String(text || ""));
-        return { width: w };
+        var str = String(text || "");
+        var w = __native_canvas2d.measureText(this._handle, str);
+        var res = { width: w };
+        var fm = /(\d+(?:\.\d+)?)px/.exec(this._font || "");
+        var handle = this._handle, size = fm ? parseFloat(fm[1]) : 10, cache = null;
+        /* actualBoundingBox*: the real glyph box, worked out only when a script asks for it (text-fitting plugins do) */
+        function bounds() {
+            if (!cache) cache = __native_canvas2d.measureTextBounds ? __native_canvas2d.measureTextBounds(handle, str) : [0, w, size * 0.8, size * 0.2];
+            return cache;
+        }
+        Object.defineProperty(res, "actualBoundingBoxLeft", { enumerable: true, get: function() { return bounds()[0]; } });
+        Object.defineProperty(res, "actualBoundingBoxRight", { enumerable: true, get: function() { return bounds()[1]; } });
+        Object.defineProperty(res, "actualBoundingBoxAscent", { enumerable: true, get: function() { return bounds()[2]; } });
+        Object.defineProperty(res, "actualBoundingBoxDescent", { enumerable: true, get: function() { return bounds()[3]; } });
+        res.fontBoundingBoxAscent = size * 0.88;
+        res.fontBoundingBoxDescent = size * 0.12;
+        res.emHeightAscent = size * 0.8;
+        res.emHeightDescent = size * 0.2;
+        return res;
     };
 
     CanvasRenderingContext2D.prototype.drawImage = function(source) {
@@ -507,8 +559,12 @@
     }
 
     CanvasGradient.prototype.addColorStop = function(offset, color) {
-        this._stops.push({ offset: offset, color: parseColor(color) });
-        this._stops.sort(function(a, b) { return a.offset - b.offset; });
+        var stops = this._stops, n = stops.length;
+        stops.push({ offset: offset, color: _parseColorShared(color) });
+        /* Stops nearly always arrive in order; sorting every time was a hot spot. */
+        if (n > 0 && stops[n - 1].offset > offset) {
+            stops.sort(function(a, b) { return a.offset - b.offset; });
+        }
     };
 
     function _interpolateGradientColor(stops, t) {
@@ -560,6 +616,22 @@
 
         x = x | 0; y = y | 0; w = w | 0; h = h | 0;
         if (w <= 0 || h <= 0) return;
+
+        /* Native fill: computing a colour per pixel is far too slow in JS (a lighting plugin fills
+           whole-screen radial gradients every frame). */
+        if (typeof __native_canvas2d.fillGradient === 'function') {
+            var flat = [];
+            for (var si = 0; si < stops.length; si++) {
+                var sc = stops[si].color;
+                flat.push(stops[si].offset, sc[0], sc[1], sc[2], sc[3]);
+            }
+            if (grad._radial) {
+                __native_canvas2d.fillGradient(this._handle, x, y, w, h, 1, grad._cx, grad._cy, grad._r0, grad._r1, flat);
+            } else {
+                __native_canvas2d.fillGradient(this._handle, x, y, w, h, 0, grad._x0, grad._y0, grad._x1, grad._y1, flat);
+            }
+            return;
+        }
 
         if (grad._radial) {
             var cx = grad._cx, cy = grad._cy;
@@ -779,8 +851,8 @@
 
     CanvasRenderingContext2D.prototype.lineTo = function(x, y) {
         if (!this._pathCur) { this.moveTo(x, y); return; }
-        var p = this._tx(x, y);
-        this._pathCur.pts.push(p[0], p[1]);
+        var m = this._ctm;
+        this._pathCur.pts.push(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
         this._curPt = [x, y];
     };
 
@@ -820,12 +892,24 @@
             if (delta < -TWO_PI) delta = -TWO_PI;
         }
         var segs = Math.max(8, Math.min(96, Math.ceil(r * this._ctmScale() * 0.5 * Math.abs(delta) / Math.PI * 2)));
-        for (var i = 0; i <= segs; i++) {
-            var ang = sa + delta * (i / segs);
-            var px = x + Math.cos(ang) * r, py = y + Math.sin(ang) * r;
-            /* An open subpath is joined to the arc start by a line. */
-            if (i === 0 && !this._pathCur) this.moveTo(px, py); else this.lineTo(px, py);
+        /* Points are generated by rotating a vector step by step (no trig per point) and mapped through the
+           CTM straight into the subpath (no per-point arrays), because lighting plugins draw many arcs per
+           frame. An open subpath is joined to the arc start by a line. */
+        var m = this._ctm, m0 = m[0], m1 = m[1], m2 = m[2], m3 = m[3], m4 = m[4], m5 = m[5];
+        var step = delta / segs, cs = Math.cos(step), sn = Math.sin(step);
+        var ux = Math.cos(sa), uy = Math.sin(sa);
+        var px = x + ux * r, py = y + uy * r;
+        if (!this._pathCur) this.moveTo(px, py);
+        else this._pathCur.pts.push(m0 * px + m2 * py + m4, m1 * px + m3 * py + m5);
+        var pts = this._pathCur.pts;
+        for (var i = 1; i <= segs; i++) {
+            var nx = ux * cs - uy * sn;
+            uy = ux * sn + uy * cs;
+            ux = nx;
+            px = x + ux * r; py = y + uy * r;
+            pts.push(m0 * px + m2 * py + m4, m1 * px + m3 * py + m5);
         }
+        this._curPt = [px, py];
     };
 
     CanvasRenderingContext2D.prototype.ellipse = function(x, y, rx, ry, rotation, sa, ea, ccw) {
@@ -906,9 +990,53 @@
         }
     };
 
+    /* Native path fill: flattens the subpaths and hands them to the rasteriser in canvas2d.c. `grad` is a
+       device-space CanvasGradient or null for the current fill colour. Returns false if not available. */
+    CanvasRenderingContext2D.prototype._fillPathNative = function(grad, path) {
+        if (typeof __native_canvas2d.fillPath !== 'function') return false;
+        var pts, counts = [];
+        if (path.length === 1) {
+            /* The usual case (one circle or one box): hand the point list over without copying. */
+            pts = path[0].pts;
+            if ((pts.length >> 1) < 3) return true;
+            counts.push(pts.length >> 1);
+        } else {
+            pts = [];
+            for (var s = 0; s < path.length; s++) {
+                var sp = path[s].pts, n = sp.length >> 1;
+                if (n < 3) continue;
+                for (var i = 0; i < sp.length; i++) pts.push(sp[i]);
+                counts.push(n);
+            }
+            if (!counts.length) return true;
+        }
+        var c = this._clip;
+        var flat = [], kind = -1, p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+        if (grad) {
+            var stops = grad._stops;
+            if (stops.length === 0) return true;
+            for (var si = 0; si < stops.length; si++) {
+                var sc = stops[si].color;
+                flat.push(stops[si].offset, sc[0], sc[1], sc[2], sc[3]);
+            }
+            if (grad._radial) { kind = 1; p0 = grad._cx; p1 = grad._cy; p2 = grad._r0; p3 = grad._r1; }
+            else { kind = 0; p0 = grad._x0; p1 = grad._y0; p2 = grad._x1; p3 = grad._y1; }
+        }
+        __native_canvas2d.fillPath(this._handle, pts, counts,
+            c ? c.x : 0, c ? c.y : 0, c ? c.w : 0, c ? c.h : 0, c ? 1 : 0,
+            kind, p0, p1, p2, p3, flat);
+        return true;
+    };
+
     CanvasRenderingContext2D.prototype.fill = function() {
         if (!this._handle || !this._path.length) return;
         var self = this, h = this._handle;
+        if (this._fillStyle instanceof CanvasGradient) {
+            if (this._fillPathNative(this._gradientToDevice(this._fillStyle), this._path)) return;
+        } else {
+            this._syncFillColor();
+            if (this._fillPathNative(null, this._path)) return;
+        }
         if (this._fillStyle instanceof CanvasGradient) {
             this._rasterizePath(function(x, y, w) { self._fillGradientRect(x, y, w, 1); });
         } else {
@@ -939,7 +1067,9 @@
         this._path = quads;
         var c = parseColor(this._strokeStyle);
         __native_canvas2d.setFillColor(h, c[0], c[1], c[2], c[3]);
-        this._rasterizePath(function(x, y, w) { __native_canvas2d.fillRect(h, x, y, w, 1); });
+        if (!this._fillPathNative(null, quads)) {
+            this._rasterizePath(function(x, y, w) { __native_canvas2d.fillRect(h, x, y, w, 1); });
+        }
         this._path = saved;
         this._syncFillColor();
     };
@@ -980,9 +1110,13 @@
             __native_canvas2d.destroy(this._handle);
         }
         this._handle = 0;
+        this._token = null;
     };
 
     /* Replaces the stub context in dom_shim.js. */
+    /* Plugins patch or test against these by name (CanvasGradient.prototype..., instanceof). */
+    if (typeof globalThis.CanvasGradient === 'undefined') globalThis.CanvasGradient = CanvasGradient;
+    if (typeof globalThis.CanvasRenderingContext2D === 'undefined') globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
     globalThis.__Canvas2DContext = CanvasRenderingContext2D;
 
     /* Exposed for tests. */

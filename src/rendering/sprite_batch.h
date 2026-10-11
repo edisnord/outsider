@@ -40,6 +40,10 @@ void sprite_batch_begin(SpriteBatch *sb);
 
 /* Queue an axis-aligned textured quad (texture 0 = untextured white).
    UVs are normalized; tint is ARGB multiplied with the texture. */
+/* Tells the batch that the render target has just been cleared to opaque black (1) or is not in that state (0); see
+   sprite_batch.c. */
+void sprite_batch_set_pristine(SpriteBatch *sb, int pristine);
+
 void sprite_batch_draw(SpriteBatch *sb, uint32_t texture,
                        float x, float y, float w, float h,
                        float u0, float v0, float u1, float v1,

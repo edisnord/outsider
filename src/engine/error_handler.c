@@ -77,12 +77,30 @@ void error_handler_log(LogLevel level, const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
+    struct timespec t0, t1, t2, t3;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     time_t now = time(NULL);
     struct tm tm_buf;
+    /* localtime_r() cost 100 ms or more per call on the console (every log line stalled the game for that long;
+       measured with the stall timing below). The local time offset is looked up once, and later lines are
+       formatted from UTC plus that offset. */
 #ifdef _WIN32
     struct tm *tm_info = (localtime_s(&tm_buf, &now) == 0) ? &tm_buf : NULL;
 #else
-    struct tm *tm_info = localtime_r(&now, &tm_buf);
+    static int have_offset;
+    static long utc_offset;
+    if (!have_offset) {
+        /* the local offset from UTC: UTC's fields read back as a local time are off by exactly that */
+        struct tm gm;
+        if (gmtime_r(&now, &gm)) {
+            gm.tm_isdst = -1;
+            time_t as_local = mktime(&gm);
+            if (as_local != (time_t)-1) utc_offset = (long)(now - as_local);
+        }
+        have_offset = 1;
+    }
+    time_t shifted = now + (time_t)utc_offset;
+    struct tm *tm_info = gmtime_r(&shifted, &tm_buf);
 #endif
     char timestamp[32];
     if (tm_info) {
@@ -90,15 +108,32 @@ void error_handler_log(LogLevel level, const char *fmt, ...)
     } else {
         snprintf(timestamp, sizeof(timestamp), "<unknown time>");
     }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
 
     const char *level_name = error_handler_level_name(level);
 
     FILE *out = (level >= LOG_WARN) ? stderr : stdout;
     fprintf(out, "[%s] [%s] %s\n", timestamp, level_name, msg);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
 
     if (s_log_file) {
         fprintf(s_log_file, "[%s] [%s] %s\n", timestamp, level_name, msg);
         fflush(s_log_file);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t3);
+
+    /* Says where the time went when a message takes long (first few only). */
+    {
+        static int slow_reported;
+        double total = (double)(t3.tv_sec - t0.tv_sec) * 1000.0 + (double)(t3.tv_nsec - t0.tv_nsec) / 1e6;
+        if (total > 50.0 && slow_reported < 5) {
+            slow_reported++;
+            fprintf(out, "[%s] [WARN] error_handler: slow log call %.0f ms: time %.0f ms, print %.0f ms, file %.0f ms\n",
+                    timestamp, total,
+                    (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6,
+                    (double)(t2.tv_sec - t1.tv_sec) * 1000.0 + (double)(t2.tv_nsec - t1.tv_nsec) / 1e6,
+                    (double)(t3.tv_sec - t2.tv_sec) * 1000.0 + (double)(t3.tv_nsec - t2.tv_nsec) / 1e6);
+        }
     }
 
     if (s_callback) {
@@ -136,7 +171,7 @@ void error_handler_report_js_exception(void *engine_ptr, bool fatal)
     }
 
     char stack_buf[4096] = "";
-    if (JS_IsError(ctx, exc)) {
+    if (JS_IsError(exc)) {
         JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
         if (!JS_IsUndefined(stack)) {
             const char *stack_str = JS_ToCString(ctx, stack);

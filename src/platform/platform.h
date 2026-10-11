@@ -7,6 +7,7 @@
 #define RMMZ_PLATFORM_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef struct Platform Platform;
 
@@ -27,6 +28,24 @@ void platform_swap_buffers(Platform *p);
 
 /* Query the current window dimensions. */
 void platform_get_window_size(Platform *p, int *w, int *h);
+
+/* The size the frame is finally presented at. Usually the window size; on the PS5 the game is drawn at its own
+   (smaller) size, see platform_set_virtual_size(), and scaled up to the screen. */
+void platform_get_present_size(Platform *p, int *w, int *h);
+
+/* PS5: show a finished frame (RGBA, bottom row first) by scaling it on the CPU into the window's pixel buffer and
+   handing that to the video driver, instead of blitting through the software OpenGL. Returns false when this is
+   not available (other platforms, RMMZ_GL_PRESENT=1): the caller then uses renderer_present() + platform_swap_buffers(). */
+bool platform_present_pixels(Platform *p, const uint8_t *rgba, int w, int h);
+/* True when platform_present_pixels() can be used (checked first so that the frame is only read back when it will be). */
+bool platform_cpu_present_available(Platform *p);
+
+/* Debug aid: the next frame shown by platform_present_pixels() is also written to `path` as a PPM file. */
+void platform_request_dump(Platform *p, const char *path);
+
+/* Tell the platform the size the game is drawn at (its resolution). Only the PS5 platform acts on it: the
+   window size that the runtime and the game see becomes this size, and the picture is scaled to the screen. */
+void platform_set_virtual_size(Platform *p, int w, int h);
 
 /* Set the window title. */
 void platform_set_window_title(Platform *p, const char *title);

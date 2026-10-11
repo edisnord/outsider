@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <strings.h>
+#else
+#define strcasecmp _stricmp
+#endif
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -28,6 +33,33 @@
 #define MAX_PATH_LEN 4096
 
 static char s_game_root[MAX_PATH_LEN] = "";
+
+/* NW.js (the desktop player these games are made for) treats a path that starts with "/" as relative to the folder
+   of the app (where package.json is), and "../x" from the page is allowed to reach that folder too. For a game
+   exported with a "www" folder that app folder is the one above "www" (game data such as /data/x.csv can live there).
+   The game root is what the runtime is given: the www folder itself. */
+static char s_package_root[MAX_PATH_LEN] = "";
+
+static bool plain_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static void compute_package_root(void)
+{
+    snprintf(s_package_root, sizeof(s_package_root), "%s", s_game_root);
+    const char *slash = strrchr(s_game_root, '/');
+    if (!slash || slash == s_game_root || strcasecmp(slash + 1, "www") != 0) return;
+    char parent[MAX_PATH_LEN];
+    size_t n = (size_t)(slash - s_game_root);
+    if (n >= sizeof(parent) - 16) return;
+    memcpy(parent, s_game_root, n);
+    parent[n] = '\0';
+    char probe[MAX_PATH_LEN];
+    snprintf(probe, sizeof(probe), "%s/package.json", parent);
+    if (plain_exists(probe)) snprintf(s_package_root, sizeof(s_package_root), "%s", parent);
+}
 
 /* Path resolution */
 
@@ -72,6 +104,7 @@ void file_io_set_game_root(const char *root)
         len--;
     }
     s_game_root[len] = '\0';
+    compute_package_root();
 }
 
 /* Path character equality: '/' == '\\', and case-insensitive on Windows. */
@@ -200,7 +233,17 @@ bool file_io_resolve_path(const char *relative_path, char *out, size_t out_size)
         if (s_game_root[0] != '\0') {
             size_t root_len = strlen(s_game_root);
             if (!path_has_prefix(relative_path, s_game_root)) {
-                return false;
+                /* "/data/x.csv": relative to the app folder (NW.js), else to the game root. Never outside both. */
+                if (relative_path[0] != '/' && relative_path[0] != '\\') return false;
+                char norm[1024], candidate[MAX_PATH_LEN];
+                if (!normalize_components(relative_path, norm, sizeof(norm))) return false;
+                int w1 = snprintf(candidate, sizeof(candidate), "%s/%s", s_package_root, norm);
+                if (w1 > 0 && (size_t)w1 < sizeof(candidate) && plain_exists(candidate) && (size_t)w1 < out_size) {
+                    memcpy(out, candidate, (size_t)w1 + 1);
+                    return true;
+                }
+                int w2 = snprintf(out, out_size, "%s/%s", s_game_root, norm);
+                return w2 > 0 && (size_t)w2 < out_size;
             }
             /* root="/game" must reject "/game2/...". */
             char next = relative_path[root_len];
@@ -226,9 +269,20 @@ bool file_io_resolve_path(const char *relative_path, char *out, size_t out_size)
     if (s_game_root[0] != '\0') {
         char norm[1024];
         if (path_has_traversal(relative_path)) {
-            /* ".." is fine as long as the path never leaves the root. */
+            /* ".." is fine as long as the path never leaves the root... */
             if (!normalize_components(relative_path, norm, sizeof(norm))) {
-                return false;
+                /* ...or, for a game in a "www" folder, the app folder above it (NW.js lets "../data/x" reach it). */
+                if (strcmp(s_package_root, s_game_root) == 0) return false;
+                char full[2048], clean[MAX_PATH_LEN];
+                snprintf(full, sizeof(full), "%s/%s", s_game_root + (s_game_root[0] == '/' ? 1 : 0), relative_path);
+                if (!normalize_components(full, clean, sizeof(clean))) return false;
+                char abs_path[MAX_PATH_LEN + 2];
+                int w = snprintf(abs_path, sizeof(abs_path), "%s%s", s_game_root[0] == '/' ? "/" : "", clean);
+                if (w <= 0 || (size_t)w >= out_size) return false;
+                size_t plen = strlen(s_package_root);
+                if (strncmp(abs_path, s_package_root, plen) != 0 || (abs_path[plen] != '/' && abs_path[plen] != '\0')) return false;
+                memcpy(out, abs_path, (size_t)w + 1);
+                return true;
             }
             relative_path = norm;
         }
@@ -244,63 +298,182 @@ bool file_io_resolve_path(const char *relative_path, char *out, size_t out_size)
 
 /* File read */
 
-char *file_io_read_text(const char *path, size_t *out_size)
+/* ---- encrypted assets -------------------------------------------------------------------------------
+   RPG Maker MV/MZ can encrypt images and sounds when a game is deployed: "img/x.png" becomes "img/x.png_"
+   (MZ) or "img/x.rpgmvp" (MV), "audio/bgm/y.ogg" becomes "y.ogg_" / "y.rpgmvo", and so on. The format is a
+   16 byte header ("RPGMV" ...) followed by the file whose first 16 bytes are XORed with the key stored in
+   data/System.json ("encryptionKey", 32 hex digits). The browser player decrypts in JavaScript; here a read
+   of a file that does not exist looks for the encrypted twin and decrypts it on the fly, so encrypted games
+   run as they are. data/System.json is reported with the encryption flags cleared, so that the game's own
+   scripts do not try to decrypt again. */
+
+static bool s_key_tried;
+static bool s_key_valid;
+static uint8_t s_key[16];
+
+static void load_encryption_key(void)
 {
-    if (!path) return NULL;
+    if (s_key_tried) return;
+    s_key_tried = true;
 
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s%sdata/System.json", s_game_root, s_game_root[0] ? "/" : "");
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-
+    if (!f) return;
     fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
+    long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-
-    if (fsize < 0) {
-        fclose(f);
-        return NULL;
-    }
-
-    char *buf = malloc((size_t)fsize + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-
-    size_t nread = fread(buf, 1, (size_t)fsize, f);
+    if (size <= 0 || size > 16 * 1024 * 1024) { fclose(f); return; }
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(f); return; }
+    size_t n = fread(buf, 1, (size_t)size, f);
     fclose(f);
-    buf[nread] = '\0';
+    buf[n] = '\0';
 
-    if (out_size) *out_size = nread;
-    return buf;
+    const char *k = strstr(buf, "\"encryptionKey\"");
+    if (k) {
+        k = strchr(k + 15, ':');
+        if (k) k = strchr(k, '"');
+        if (k) {
+            k++;
+            int ok = 1;
+            for (int i = 0; i < 16 && ok; i++) {
+                int hi = hex_value(k[2 * i]), lo = hex_value(k[2 * i + 1]);
+                if (hi < 0 || lo < 0) ok = 0;
+                else s_key[i] = (uint8_t)(hi * 16 + lo);
+            }
+            s_key_valid = ok != 0;
+        }
+    }
+    free(buf);
 }
 
-uint8_t *file_io_read_binary(const char *path, size_t *out_size)
-{
-    if (!path || !out_size) return NULL;
+static const char *const s_enc_exts[][3] = {
+    { ".png", ".png_", ".rpgmvp" },
+    { ".ogg", ".ogg_", ".rpgmvo" },
+    { ".m4a", ".m4a_", ".rpgmvm" },
+};
 
+/* Path of the idx-th (0 or 1) encrypted twin of `path`, or false if `path` is not an image or sound name. */
+static bool encrypted_twin(const char *path, int idx, char *out, size_t out_size)
+{
+    size_t len = strlen(path);
+    for (size_t e = 0; e < sizeof(s_enc_exts) / sizeof(s_enc_exts[0]); e++) {
+        size_t elen = strlen(s_enc_exts[e][0]);
+        if (len > elen && strcasecmp(path + len - elen, s_enc_exts[e][0]) == 0) {
+            const char *repl = s_enc_exts[e][1 + idx];
+            if (len - elen + strlen(repl) + 1 > out_size) return false;
+            memcpy(out, path, len - elen);
+            strcpy(out + len - elen, repl);
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint8_t *raw_read(const char *path, size_t *out_size)
+{
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-
     if (fsize < 0) {
         fclose(f);
         return NULL;
     }
 
-    /* +1 so an empty file still yields a non-NULL buffer (malloc(0) may be NULL). */
+    /* +1: NUL terminator for text, and an empty file still yields a non-NULL buffer. */
     uint8_t *buf = malloc((size_t)fsize + 1);
     if (!buf) {
         fclose(f);
         return NULL;
     }
-
     size_t nread = fread(buf, 1, (size_t)fsize, f);
     fclose(f);
-
+    buf[nread] = '\0';
     *out_size = nread;
+    return buf;
+}
+
+/* Reads and decrypts the encrypted twin of a missing file. */
+static uint8_t *read_encrypted_twin(const char *path, size_t *out_size)
+{
+    char twin[MAX_PATH_LEN];
+    for (int idx = 0; idx < 2; idx++) {
+        if (!encrypted_twin(path, idx, twin, sizeof(twin))) return NULL;
+        uint8_t *buf = raw_read(twin, out_size);
+        if (!buf) continue;
+        load_encryption_key();
+        if (!s_key_valid || *out_size < 32 || memcmp(buf, "RPGMV", 5) != 0) {
+            free(buf);
+            return NULL;
+        }
+        for (int i = 0; i < 16; i++) buf[16 + i] ^= s_key[i];
+        memmove(buf, buf + 16, *out_size - 16);
+        *out_size -= 16;
+        buf[*out_size] = '\0';
+        return buf;
+    }
+    return NULL;
+}
+
+static bool is_system_json(const char *path)
+{
+    size_t len = strlen(path);
+    const char *name = "data/System.json";
+    size_t nlen = strlen(name);
+    return len >= nlen && strcasecmp(path + len - nlen, name) == 0;
+}
+
+/* Sets "hasEncryptedImages"/"hasEncryptedAudio" to false in the JSON text (the buffer is replaced). */
+static uint8_t *patch_system_json(uint8_t *buf, size_t *size)
+{
+    static const char *const keys[2] = { "\"hasEncryptedImages\"", "\"hasEncryptedAudio\"" };
+    load_encryption_key();
+    if (!s_key_valid) return buf;   /* cannot decrypt: leave the game to fail as it would */
+    for (int k = 0; k < 2; k++) {
+        char *at = strstr((char *)buf, keys[k]);
+        if (!at) continue;
+        char *v = at + strlen(keys[k]);
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        if (*v != ':') continue;
+        v++;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        if (strncmp(v, "true", 4) != 0) continue;
+        size_t off = (size_t)(v - (char *)buf);
+        uint8_t *nb = malloc(*size + 2);
+        if (!nb) return buf;
+        memcpy(nb, buf, off);
+        memcpy(nb + off, "false", 5);
+        memcpy(nb + off + 5, buf + off + 4, *size - off - 4 + 1);   /* including the NUL */
+        free(buf);
+        buf = nb;
+        *size += 1;
+    }
+    return buf;
+}
+
+/* File read */
+
+char *file_io_read_text(const char *path, size_t *out_size)
+{
+    if (!path) return NULL;
+    size_t size = 0;
+    uint8_t *buf = raw_read(path, &size);
+    if (!buf) buf = read_encrypted_twin(path, &size);
+    if (buf && is_system_json(path)) buf = patch_system_json(buf, &size);
+    if (buf && out_size) *out_size = size;
+    return (char *)buf;
+}
+
+uint8_t *file_io_read_binary(const char *path, size_t *out_size)
+{
+    if (!path || !out_size) return NULL;
+    uint8_t *buf = raw_read(path, out_size);
+    if (!buf) buf = read_encrypted_twin(path, out_size);
+    if (buf && is_system_json(path)) buf = patch_system_json(buf, out_size);
     return buf;
 }
 
@@ -360,7 +533,14 @@ bool file_io_exists(const char *path)
 {
     if (!path) return false;
     struct stat st;
-    return portable_stat(path, &st) == 0;
+    if (portable_stat(path, &st) == 0) return true;
+    /* an encrypted image or sound counts as existing (it is decrypted when read) */
+    char twin[MAX_PATH_LEN];
+    for (int idx = 0; idx < 2; idx++) {
+        if (!encrypted_twin(path, idx, twin, sizeof(twin))) break;
+        if (portable_stat(twin, &st) == 0) return true;
+    }
+    return false;
 }
 
 bool file_io_is_directory(const char *path)

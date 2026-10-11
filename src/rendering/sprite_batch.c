@@ -69,6 +69,7 @@ struct SpriteBatch {
     int       draw_calls;      /* draw calls this frame */
     uint32_t  current_texture; /* GL texture currently batched */
     int       current_blend;   /* current blend mode */
+    int       pristine;        /* the target was just cleared to opaque black and nothing has been drawn on it since */
     Vertex   *vertices;        /* CPU-side vertex buffer */
 
     /* Viewport bounds for frustum culling */
@@ -337,6 +338,7 @@ void sprite_batch_begin(SpriteBatch *sb)
     sb->draw_calls = 0;
     sb->current_texture = 0;
     sb->current_blend = BLEND_MODE_NORMAL;
+    sb->pristine = 0;
 
 #ifdef RMMZ_HAS_GL
     glDisable(GL_DEPTH_TEST);
@@ -406,6 +408,15 @@ void sprite_batch_draw_verts(SpriteBatch *sb, uint32_t texture,
     /* Use white texture for untextured draws. */
 #ifdef RMMZ_HAS_GL
     if (texture == 0) texture = sb->white_texture;
+    /* An opaque black rectangle on a target that is opaque black already changes nothing (scenes start with one that
+       covers the whole screen, which costs a full screen of pixels for the software renderer). */
+    if (sb->pristine) {
+        if (sb->current_blend == BLEND_MODE_NORMAL && texture == sb->white_texture && (tint & 0xFFFFFFu) == 0 && alpha >= 1.0f) {
+            sb->frame_culled++;
+            return;
+        }
+        sb->pristine = 0;
+    }
 #endif
 
     /* Flush if texture changed or batch full. */
@@ -454,6 +465,15 @@ void sprite_batch_draw_verts_uv(SpriteBatch *sb, uint32_t texture,
 
 #ifdef RMMZ_HAS_GL
     if (texture == 0) texture = sb->white_texture;
+    /* An opaque black rectangle on a target that is opaque black already changes nothing (scenes start with one that
+       covers the whole screen, which costs a full screen of pixels for the software renderer). */
+    if (sb->pristine) {
+        if (sb->current_blend == BLEND_MODE_NORMAL && texture == sb->white_texture && (tint & 0xFFFFFFu) == 0 && alpha >= 1.0f) {
+            sb->frame_culled++;
+            return;
+        }
+        sb->pristine = 0;
+    }
 #endif
     if (sb->quad_count > 0 &&
         (texture != sb->current_texture || sb->quad_count >= sb->max_quads)) {
@@ -504,6 +524,11 @@ void sprite_batch_end(SpriteBatch *sb)
     glUseProgram(0);
     glDisable(GL_BLEND);
 #endif
+}
+
+void sprite_batch_set_pristine(SpriteBatch *sb, int pristine)
+{
+    if (sb) sb->pristine = pristine;
 }
 
 void sprite_batch_set_blend_mode(SpriteBatch *sb, int mode)

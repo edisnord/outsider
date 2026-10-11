@@ -317,12 +317,23 @@
 
     /* --- CSS ------------------------------------------------------------- */
 
+    var styleCache = { texts: null, rules: null };
+
     function styleRules() {
-        /* Tag, #id and .class rules from <style> elements, latest wins. */
-        var rules = [];
+        /* Tag, #id and .class rules from <style> elements, latest wins. Parsed again only when the text of a
+           style element changed (the overlay asks for the rules on every frame). */
         var sheets = document.getElementsByTagName("style");
+        var texts = [];
+        for (var t = 0; t < sheets.length; t++) texts.push(sheets[t].textContent || "");
+        var cached = styleCache.texts;
+        if (cached && cached.length === texts.length) {
+            var same = true;
+            for (var q = 0; q < texts.length; q++) if (cached[q] !== texts[q]) { same = false; break; }
+            if (same) return styleCache.rules;
+        }
+        var rules = [];
         for (var i = 0; i < sheets.length; i++) {
-            var text = sheets[i].textContent || "";
+            var text = texts[i];
             var re = /([^{}]+)\{([^}]*)\}/g, m;
             while ((m = re.exec(text))) {
                 if (m[1].indexOf("@") >= 0) continue;
@@ -336,6 +347,8 @@
                 });
             }
         }
+        styleCache.texts = texts;
+        styleCache.rules = rules;
         return rules;
     }
 
@@ -453,6 +466,9 @@
         var d = el.style && el.style.display;
         if (d === "none") return true;
         if (el.style && el.style.visibility === "hidden") return true;
+        /* RPG Maker MV hides its renderer-mode label ("Canvas mode") with opacity 0 */
+        var o = el.style && el.style.opacity;
+        if (o !== undefined && o !== null && o !== "" && parseFloat(o) === 0) return true;
         return false;
     }
 
@@ -538,6 +554,7 @@
         var cs = computeStyle(el, rules);
         var tag = el.tagName;
         var f = fontOf(cs, inherited, scale);
+        if (el.id && /^errorprinter$/i.test(el.id)) f.color = "#ffffff";   /* the engines colour the message with <font> tags */
         var pad = sides(cs, "padding", scale);
         var mar = sides(cs, "margin", scale);
         var bd = border(cs, scale);
@@ -574,6 +591,8 @@
         var textContentW = 0, textContentH = 0;
         var text = textOf(el);
         var hasElementChildren = el.children && el.children.some(function(c) { return c.nodeType === 1 && c.tagName !== "STYLE"; });
+        /* the engines' error printer holds the message text and the Retry button; the text is what matters */
+        if (hasElementChildren && text && el.id && /^errorprinter$/i.test(el.id)) hasElementChildren = false;
         var lineHeight = f.size * 1.25;
         if (tag === "INPUT" || tag === "SELECT") {
             node.lines = [text];
@@ -886,15 +905,20 @@
 
         var handle = ctx._handle;
         if (!handle) return;
-        var pixels = __native_canvas2d.getPixels(handle);
-        if (!pixels) return;
+        var fastUpload = __native_renderer.updateTextureFromCanvas;
+        var pixels = fastUpload ? null : __native_canvas2d.getPixels(handle);
+        if (!fastUpload && !pixels) return;
         if (!overlay.texture || overlay.texW !== w || overlay.texH !== h) {
             if (overlay.texture) __native_renderer.deleteTexture(overlay.texture);
             overlay.texture = __native_renderer.createTexture(w, h);
             overlay.texW = w;
             overlay.texH = h;
         }
-        __native_renderer.updateTexture(overlay.texture, w, h, pixels);
+        if (!fastUpload || !fastUpload(overlay.texture, w, h, handle)) {
+            if (!pixels) pixels = __native_canvas2d.getPixels(handle);
+            if (!pixels) return;
+            __native_renderer.updateTexture(overlay.texture, w, h, pixels);
+        }
         __native_renderer.rebindBatch();
         __native_renderer.setBlendMode(0);
         __native_renderer.drawQuad(overlay.texture, minX, minY, w, h, 0, 0, 1, 1, 0xFFFFFF, 1);

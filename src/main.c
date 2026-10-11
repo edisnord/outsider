@@ -3,6 +3,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-GeneralArcade-Commercial
  */
 
+/* Linked into the PS5 title's Vulkan program, which calls outsider_main() instead of main() */
+#ifdef RMMZ_EMBEDDED
+#define main outsider_main
+#endif
+
 #include "platform/platform.h"
 #include "engine/js_engine.h"
 #include "engine/game_loop.h"
@@ -36,6 +41,10 @@
 #include <SDL3/SDL.h>
 /* SDL3 dropped the SDL2main library: including this header in the file that
    defines main() supplies the Windows GUI-subsystem WinMain entry point. */
+#if defined(RMMZ_EMBEDDED) && defined(RMMZ_PS5_VULKAN)
+/* Embedded: SDL_main_impl.h would #undef main, and with it the outsider_main rename above */
+#define SDL_MAIN_HANDLED
+#endif
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_opengl.h>
 #include <stdarg.h>
@@ -80,7 +89,45 @@ static bool find_dir_next_to_exe(const char *name, char *out, size_t out_size)
     return file_io_is_directory(out);
 }
 
+#ifdef __SCE__
+#include <pthread.h>
+/* The console starts the program's main thread with a 2 MB stack. Mesa's shader compiler and LLVM (software GL), and
+   deep JavaScript recursion in big plugin sets, need much more: Fear & Hunger 2 died with a stack overflow while its
+   plugins were loading. The whole program therefore runs on a thread with a big stack; main() only waits for it. */
+#define PS5_MAIN_STACK_SIZE (128u * 1024u * 1024u)
+
+static int real_main(int argc, char *argv[]);
+
+struct main_args {
+    int argc;
+    char **argv;
+    int result;
+};
+
+static void *main_thread(void *p)
+{
+    struct main_args *a = (struct main_args *)p;
+    a->result = real_main(a->argc, a->argv);
+    return NULL;
+}
+
 int main(int argc, char *argv[])
+{
+    struct main_args a = { argc, argv, 1 };
+    pthread_attr_t attr;
+    pthread_t thread;
+    if (pthread_attr_init(&attr) == 0 && pthread_attr_setstacksize(&attr, PS5_MAIN_STACK_SIZE) == 0 &&
+        pthread_create(&thread, &attr, main_thread, &a) == 0) {
+        pthread_join(thread, NULL);
+        return a.result;
+    }
+    return real_main(argc, argv);   /* could not start the big thread: carry on with the small stack */
+}
+
+static int real_main(int argc, char *argv[])
+#else
+int main(int argc, char *argv[])
+#endif
 {
     /* Android: printf output is lost unless routed to logcat. No-op elsewhere. */
     android_support_init_logging();
@@ -96,6 +143,7 @@ int main(int argc, char *argv[])
     const char *screenshot_path = NULL;
     const char *probe_expr = NULL;
     int watchdog_ms = 0;
+    int profile_ms = 0;
     int perf_every = 0;
     bool control_mode = false;
 
@@ -120,6 +168,9 @@ int main(int argc, char *argv[])
             /* Debug: interrupt JS that blocks a frame or eval for longer than
                this many milliseconds, logging where it was. */
             watchdog_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
+            /* Debug: sample the script stack every N ms and print the hottest stacks. */
+            profile_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--resolution") == 0 && i + 1 < argc) {
             if (sscanf(argv[++i], "%dx%d", &win_w, &win_h) != 2) {
                 fatal_error("Invalid resolution format, expected WIDTHxHEIGHT");
@@ -259,6 +310,11 @@ int main(int argc, char *argv[])
         error_handler_log(LOG_INFO, "Script watchdog enabled: %d ms", watchdog_ms);
     }
 
+    if (profile_ms > 0) {
+        js_engine_set_profile(js, (unsigned)profile_ms);
+        error_handler_log(LOG_INFO, "Script profiler enabled: %d ms", profile_ms);
+    }
+
     bind_io_register(js_engine_get_context(js));
 
     /* Initialize image loader (GL enabled since we have a context). */
@@ -354,10 +410,13 @@ int main(int argc, char *argv[])
     if (perf_every > 0) {
         game_loop_set_perf_report(loop, perf_every);
     }
-    if (max_frames > 0) {
+    {
+        /* The loop needs the renderer in normal play too: it puts the finished frame on the screen (scaled to the
+           screen's size), which otherwise only happened when a frame limit or control mode was asked for, so the
+           game came up at its own size in a corner of the screen. */
         extern Renderer *s_renderer;
-        game_loop_set_frame_limit(loop, max_frames, screenshot_path, &s_renderer);
-        if (probe_expr) game_loop_set_exit_probe(loop, probe_expr);
+        game_loop_set_frame_limit(loop, max_frames > 0 ? max_frames : 0, max_frames > 0 ? screenshot_path : NULL, &s_renderer);
+        if (max_frames > 0 && probe_expr) game_loop_set_exit_probe(loop, probe_expr);
     }
     if (control_mode) {
         extern Renderer *s_renderer;

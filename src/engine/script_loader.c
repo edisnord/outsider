@@ -20,6 +20,19 @@ static bool is_valid_plugin_name(const char *name)
     return strstr(name, "..") == NULL;
 }
 
+/* Plugins that are only a speed-up in a browser and need something this runtime does not have: AudioStreaming
+   decodes music with a WebAssembly build of stb_vorbis inside a Web Worker, so no song would ever play. Without it
+   the game loads its music the normal way, which works. */
+static bool is_skipped_plugin(const char *name)
+{
+    static const char *const skipped[] = { "AudioStreaming", NULL };
+    const char *base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    for (int i = 0; skipped[i]; i++)
+        if (strcmp(base, skipped[i]) == 0) return true;
+    return false;
+}
+
 /* Join dir + file with exactly one separator. Returns a malloc'd string. */
 static char *join_path(const char *dir, const char *file)
 {
@@ -254,6 +267,7 @@ static const char *SHIM_FILES[] = {
     "effekseer_shim.js",
     "dom_overlay.js",
     "plugin_compat.js",
+    "node_shim.js",
     NULL
 };
 
@@ -288,10 +302,40 @@ static const char *RMMZ_CORE_SCRIPTS[] = {
     NULL
 };
 
+/* RPG Maker MV core scripts in load order (MV games ship js/rpg_*.js instead). */
+static const char *RPGMV_CORE_SCRIPTS[] = {
+    "js/rpg_core.js",
+    "js/rpg_managers.js",
+    "js/rpg_objects.js",
+    "js/rpg_scenes.js",
+    "js/rpg_sprites.js",
+    "js/rpg_windows.js",
+    NULL
+};
+
+/* Library scripts of an MV game (PIXI itself is replaced by pixi_shim.js). */
+static const char *MV_LIB_SCRIPTS[] = {
+    "js/libs/lz-string.js",
+    NULL
+};
+
+/* True when the game directory holds an RPG Maker MV project rather than an MZ one. */
+static bool game_is_mv(const char *game_dir)
+{
+    char *mv = join_path(game_dir, "js/rpg_core.js");
+    char *mz = join_path(game_dir, "js/rmmz_core.js");
+    bool result = mv && file_io_exists(mv) && !(mz && file_io_exists(mz));
+    free(mv);
+    free(mz);
+    return result;
+}
+
 /* Shims loaded after the core scripts and plugins, to patch RPG Maker
    classes that depend on PIXI internals the runtime does not implement. */
 static const char *POST_CORE_SHIMS[] = {
     "tilemap_shim.js",
+    "perf_post.js",
+    "picture_slots.js",
     NULL
 };
 
@@ -315,6 +359,44 @@ static const char *LIB_SCRIPTS[] = {
     NULL
 };
 
+/* RPG Maker MZ's js/main.js declares `class Main` and then starts the game in its last lines ("const main = new Main();
+   main.run();"). In a browser the plugins load after that class exists and some of them patch Main.prototype, so the
+   class has to be defined before the plugins run, while the starting lines still have to wait until everything is loaded.
+   Evaluates the part before the starting lines now and returns the rest (malloc'ed) for later; NULL when main.js has
+   another shape (MV's, or a changed one), in which case it is simply evaluated as a whole later. */
+static char *preload_main_class(JSEngine *engine, const char *game_dir)
+{
+    char *main_path = join_path(game_dir, "js/main.js");
+    if (!main_path || !file_io_exists(main_path)) {
+        free(main_path);
+        return NULL;
+    }
+    size_t size = 0;
+    char *text = file_io_read_text(main_path, &size);
+    char *tail = NULL;
+    if (text && strstr(text, "class Main")) {
+        char *start = NULL;
+        for (char *q = strstr(text, "new Main("); q; q = strstr(q + 1, "new Main(")) start = q;
+        if (start) {
+            while (start > text && start[-1] != '\n') start--;
+            size_t tail_len = strlen(start);
+            /* only a few starting lines may follow the class */
+            if (tail_len < 400 && !strstr(start, "class ") && !strstr(start, "function ")) {
+                tail = strdup(start);
+                *start = '\0';
+                js_engine_eval(engine, "__dom_setCurrentScript('js/main.js');", "<set-main-script>");
+                if (!js_engine_eval(engine, text, main_path))
+                    fprintf(stderr, "script_loader: warning: errors during main.js (class part)\n");
+                js_engine_execute_pending_jobs(engine);
+                js_engine_eval(engine, "__dom_setCurrentScript(null);", "<clear-main-script>");
+            }
+        }
+    }
+    free(text);
+    free(main_path);
+    return tail;
+}
+
 bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *game_dir)
 {
     if (!engine || !shim_dir || !game_dir) return false;
@@ -325,9 +407,24 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
     }
     printf("script_loader: shims loaded\n");
 
+    const bool mv = game_is_mv(game_dir);
+    const char *const *lib_scripts = mv ? MV_LIB_SCRIPTS : LIB_SCRIPTS;
+    const char *const *core_scripts = mv ? RPGMV_CORE_SCRIPTS : RMMZ_CORE_SCRIPTS;
+    if (mv) {
+        printf("script_loader: RPG Maker MV game\n");
+        /* PIXI 4 API differences (MV uses PIXI 4, the shim implements PIXI 5) */
+        char *compat = join_path(shim_dir, "mv_compat.js");
+        if (compat) {
+            if (!js_engine_eval_file(engine, compat))
+                fprintf(stderr, "script_loader: warning: failed to load mv_compat.js\n");
+            js_engine_execute_pending_jobs(engine);
+            free(compat);
+        }
+    }
+
     /* Step 2: Load library scripts (pako, etc.) */
-    for (int i = 0; LIB_SCRIPTS[i] != NULL; i++) {
-        char *path = join_path(game_dir, LIB_SCRIPTS[i]);
+    for (int i = 0; lib_scripts[i] != NULL; i++) {
+        char *path = join_path(game_dir, lib_scripts[i]);
         if (!path) return false;
 
         if (file_io_exists(path)) {
@@ -336,7 +433,7 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
                 fprintf(stderr, "script_loader: warning: failed to load lib: %s\n", path);
             }
             js_engine_execute_pending_jobs(engine);
-            note_script_loaded(engine, LIB_SCRIPTS[i]);
+            note_script_loaded(engine, lib_scripts[i]);
         } else {
             fprintf(stderr, "script_loader: warning: lib not found: %s\n", path);
         }
@@ -345,8 +442,8 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
     printf("script_loader: libraries loaded\n");
 
     /* Step 3: Load RPG Maker MZ core scripts */
-    for (int i = 0; RMMZ_CORE_SCRIPTS[i] != NULL; i++) {
-        char *path = join_path(game_dir, RMMZ_CORE_SCRIPTS[i]);
+    for (int i = 0; core_scripts[i] != NULL; i++) {
+        char *path = join_path(game_dir, core_scripts[i]);
         if (!path) return false;
 
         if (file_io_exists(path)) {
@@ -354,16 +451,26 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
             if (!ok) {
                 /* Non-fatal: core scripts may reference PIXI features the shim lacks. */
                 fprintf(stderr, "script_loader: note: errors during %s (may be expected for PIXI deps)\n",
-                        RMMZ_CORE_SCRIPTS[i]);
+                        core_scripts[i]);
             }
             js_engine_execute_pending_jobs(engine);
-            note_script_loaded(engine, RMMZ_CORE_SCRIPTS[i]);
+            note_script_loaded(engine, core_scripts[i]);
         } else {
             fprintf(stderr, "script_loader: warning: core script not found: %s\n", path);
         }
         free(path);
     }
     printf("script_loader: core scripts loaded\n");
+
+    char *main_tail = mv ? NULL : preload_main_class(engine, game_dir);
+
+    /* MV: main.js sets window.onload before the plugin scripts are inserted in a browser; plugins wrap it. */
+    if (mv) {
+        js_engine_eval(engine,
+            "window.__rm_default_onload = function() { SceneManager.run(Scene_Boot); };"
+            "if (typeof window.onload !== 'function') window.onload = window.__rm_default_onload;",
+            "<mv-onload-default>");
+    }
 
     /* Step 4: Load enabled plugins */
     char *plugins_path = join_path(game_dir, "js/plugins.js");
@@ -400,8 +507,22 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
                 if (!plugins->entries[i].status) continue;
 
                 const char *pname = plugins->entries[i].name;
+                /* PluginManager.setup() loads a plugin name once, even when plugins.js lists it twice: running a
+                   plugin twice makes plugins that keep their alias in a shared property call themselves forever. */
+                bool listed_before = false;
+                for (size_t j = 0; j < i; j++) {
+                    if (plugins->entries[j].status && strcmp(plugins->entries[j].name, pname) == 0) { listed_before = true; break; }
+                }
+                if (listed_before) {
+                    printf("script_loader: plugin %s is listed again, not run twice\n", pname);
+                    continue;
+                }
                 if (!is_valid_plugin_name(pname)) {
                     fprintf(stderr, "Skipping plugin with invalid name: %s\n", pname);
+                    continue;
+                }
+                if (is_skipped_plugin(pname)) {
+                    printf("script_loader: plugin %s not run (needs WebAssembly workers; normal audio is used)\n", pname);
                     continue;
                 }
 
@@ -447,7 +568,7 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
                     /* Logged before eval so a native crash inside a plugin
                        leaves its name as the last line of the log. */
                     printf("script_loader: plugin %s\n", plugins->entries[i].name);
-                    bool ok = js_engine_eval_file(engine, path);
+                    bool ok = deobf_eval_plugin_file(engine, path, shim_dir);
                     if (!ok) {
                         fprintf(stderr, "script_loader: warning: plugin error: %s\n",
                                 plugins->entries[i].name);
@@ -470,6 +591,7 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
     /* Step 4b: Post-core shims go after plugins so they win over plugin
        patches to the same engine classes (e.g. Tilemap.Layer.prototype.render). */
     for (int i = 0; POST_CORE_SHIMS[i] != NULL; i++) {
+        if (mv) break;   /* tilemap_shim.js replaces the MZ tilemap; MV uses its own canvas tilemap */
         char *path = join_path(shim_dir, POST_CORE_SHIMS[i]);
         if (!path) return false;
 
@@ -480,14 +602,30 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
         js_engine_execute_pending_jobs(engine);
         free(path);
     }
+    if (mv) {
+        char *post = join_path(shim_dir, "mv_post.js");
+        if (post) {
+            if (file_io_exists(post)) js_engine_eval_file(engine, post);
+            js_engine_execute_pending_jobs(engine);
+            free(post);
+        }
+        /* picture slots on demand applies to MV as well (the MZ loop above handles MZ) */
+        char *slots = join_path(shim_dir, "picture_slots.js");
+        if (slots) {
+            if (file_io_exists(slots)) js_engine_eval_file(engine, slots);
+            js_engine_execute_pending_jobs(engine);
+            free(slots);
+        }
+    }
     printf("script_loader: post-core shims loaded\n");
 
-    /* Step 5: Load main.js */
+    /* Step 5: Load main.js (for MZ the class part ran before the plugins, only the starting lines are left) */
     char *main_path = join_path(game_dir, "js/main.js");
+    if (mv) js_engine_eval(engine, "window.__rm_onload_chain = window.onload;", "<mv-onload-chain>");
     if (main_path && file_io_exists(main_path)) {
         js_engine_eval(engine, "__dom_setCurrentScript('js/main.js');",
                        "<set-main-script>");
-        bool ok = js_engine_eval_file(engine, main_path);
+        bool ok = main_tail ? js_engine_eval(engine, main_tail, main_path) : js_engine_eval_file(engine, main_path);
         if (!ok) {
             fprintf(stderr, "script_loader: warning: errors during main.js\n");
         }
@@ -497,6 +635,18 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
         printf("script_loader: main.js loaded\n");
     }
     free(main_path);
+    free(main_tail);
+    if (mv) {
+        js_engine_eval(engine,
+            "(function() {"
+            "  var chain = window.__rm_onload_chain, cur = window.onload;"
+            "  if (typeof chain === 'function' && chain !== cur && typeof cur === 'function' &&"
+            "      /^function\\(\\)\\{SceneManager\\.run\\(Scene_Boot\\);?\\}$/.test(String(cur).replace(/\\s+/g, ''))) {"
+            "    window.onload = chain;"
+            "  }"
+            "})();",
+            "<mv-onload-restore>");
+    }
 
     /* Step 6: Start the game. main.js waits for DOM script-load callbacks that
        never fire here (scripts are pre-loaded), so run PluginManager.setup and
@@ -508,6 +658,17 @@ bool script_loader_load_all(JSEngine *engine, const char *shim_dir, const char *
         "}",
         "<plugin-setup>");
     js_engine_execute_pending_jobs(engine);
+
+    if (mv) {
+        /* the browser's load event: runs the plugins' wrappers, then the game's own start */
+        js_engine_eval(engine,
+            "if (typeof SceneManager !== 'undefined' && !SceneManager._scene && !SceneManager._nextScene"
+            "    && typeof window.onload === 'function') {"
+            "    try { window.onload(); } catch (e) { console.error('window.onload: ' + (e && e.stack || e)); }"
+            "}",
+            "<mv-window-onload>");
+        js_engine_execute_pending_jobs(engine);
+    }
 
     js_engine_eval(engine,
         "if (typeof SceneManager !== 'undefined'"

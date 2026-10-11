@@ -11,6 +11,7 @@
 void tilemap_draw_tiles(const float *elements, int count,
                         const TilesetInfo *tilesets, int num_tilesets,
                         float offset_x, float offset_y,
+                        float scale_x, float scale_y,
                         SpriteBatch *batch)
 {
     if (!elements || count <= 0 || !batch) return;
@@ -20,17 +21,19 @@ void tilemap_draw_tiles(const float *elements, int count,
         int   set_number = (int)e[0];
         float sx = e[1];
         float sy = e[2];
-        float dx = e[3] + offset_x;
-        float dy = e[4] + offset_y;
+        float dx = e[3] * scale_x + offset_x;
+        float dy = e[4] * scale_y + offset_y;
         float w  = e[5];
         float h  = e[6];
+        float dw = w * scale_x;
+        float dh = h * scale_y;
 
         if (w <= 0 || h <= 0) continue;
 
         if (set_number < 0) {
             /* Shadow tile: black-tinted white texture at 50% alpha. */
             sprite_batch_draw(batch, 0,
-                              dx, dy, w, h,
+                              dx, dy, dw, dh,
                               0.0f, 0.0f, 1.0f, 1.0f,
                               0xFF000000, 0.5f);
             continue;
@@ -49,7 +52,7 @@ void tilemap_draw_tiles(const float *elements, int count,
         float v1 = (sy + h) * inv_h;
 
         sprite_batch_draw(batch, ts->gl_texture,
-                          dx, dy, w, h,
+                          dx, dy, dw, dh,
                           u0, v0, u1, v1,
                           0xFFFFFFFF, 1.0f);
     }

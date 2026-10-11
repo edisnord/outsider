@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-GeneralArcade-Commercial
  */
 
+#include "engine/js_engine.h"
 #include "bindings/bind_font.h"
 #include "rendering/font_manager.h"
 #include "rendering/canvas2d.h"
@@ -20,6 +21,7 @@
 static JSValue js_font_load(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("font.font_load");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "loadFont requires family and ArrayBuffer");
@@ -48,6 +50,7 @@ static JSValue js_font_load(JSContext *ctx, JSValueConst this_val,
 static JSValue js_font_load_file(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("font.font_load_file");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "loadFontFile requires family and path");
@@ -93,6 +96,7 @@ static JSValue js_font_load_file(JSContext *ctx, JSValueConst this_val,
 static JSValue js_font_has(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("font.font_has");
     (void)this_val;
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "hasFont requires family name");
@@ -109,6 +113,7 @@ static JSValue js_font_has(JSContext *ctx, JSValueConst this_val,
 static JSValue js_font_get_metrics(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("font.font_get_metrics");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "getMetrics requires family and pixelSize");
@@ -142,6 +147,7 @@ static JSValue js_font_get_metrics(JSContext *ctx, JSValueConst this_val,
 static JSValue js_font_measure_text(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("font.font_measure_text");
     (void)this_val;
     if (argc < 3)
         return JS_ThrowTypeError(ctx, "measureText requires family, pixelSize, text");
@@ -171,6 +177,7 @@ static JSValue js_font_measure_text(JSContext *ctx, JSValueConst this_val,
 static JSValue js_font_count(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("font.font_count");
     (void)this_val;
     (void)argc;
     (void)argv;
@@ -181,6 +188,7 @@ static JSValue js_font_count(JSContext *ctx, JSValueConst this_val,
 static JSValue js_font_names(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("font.font_names");
     (void)this_val;
     (void)argc;
     (void)argv;

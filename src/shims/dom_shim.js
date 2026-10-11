@@ -419,7 +419,7 @@
         child.parentElement = this;
         /* Re-register an element that was removed earlier. */
         if (_allCreatedElements && _allCreatedElements.indexOf(child) < 0) {
-            _allCreatedElements.push(child);
+            _allCreatedElements.push(child); _elemGen++;
         }
         _runInsertedScript(child);
         return child;
@@ -490,7 +490,7 @@
         newChild.parentNode = this;
         newChild.parentElement = this;
         if (_allCreatedElements && _allCreatedElements.indexOf(newChild) < 0) {
-            _allCreatedElements.push(newChild);
+            _allCreatedElements.push(newChild); _elemGen++;
         }
         _runInsertedScript(newChild);
         return newChild;
@@ -530,8 +530,28 @@
         return [];
     };
 
+    /* HTMLCollection stand-in: an array with item() and namedItem() (MV does head.item(0).appendChild(style)) */
+    function _asCollection(arr) {
+        Object.defineProperty(arr, "item", { value: function(i) { return this[i] || null; }, enumerable: false });
+        Object.defineProperty(arr, "namedItem", {
+            value: function(n) {
+                for (var i = 0; i < this.length; i++) if (this[i].id === n || this[i].name === n) return this[i];
+                return null;
+            }, enumerable: false
+        });
+        return arr;
+    }
+
     HTMLElement.prototype.getElementsByTagName = function(tag) {
-        return [];
+        var upper = String(tag).toUpperCase(), out = [];
+        (function walk(el) {
+            var kids = el.children || [];
+            for (var i = 0; i < kids.length; i++) {
+                if (upper === "*" || kids[i].tagName === upper) out.push(kids[i]);
+                walk(kids[i]);
+            }
+        })(this);
+        return _asCollection(out);
     };
 
     HTMLElement.prototype.focus = function() {};
@@ -567,8 +587,15 @@
         set: function(v) { this._innerHTML = v; this.children = []; this.childNodes = []; }
     });
 
+    /* textContent is the text of the markup set with innerHTML: <br> becomes a line break, other tags disappear
+       (the engines' error messages are set as HTML and must show up as readable text) */
     Object.defineProperty(HTMLElement.prototype, "textContent", {
-        get: function() { return this._innerHTML; },
+        get: function() {
+            var h = this._innerHTML;
+            if (typeof h !== "string" || h.indexOf("<") < 0) return h;
+            return h.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&lt;/g, "<")
+                    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+        },
         set: function(v) { this._innerHTML = v; }
     });
 
@@ -824,6 +851,7 @@
                                     return;
                                 }
                                 self._imageHandle = result.handle;
+                                self._imageToken = __native_image.createImageToken ? __native_image.createImageToken(result.handle) : null;
                                 self._glTextureId = result.glTexture || 0;
                                 self._naturalWidth = result.width;
                                 self._naturalHeight = result.height;
@@ -860,6 +888,7 @@
                             return;
                         }
                         self._imageHandle = info.handle;
+                        self._imageToken = __native_image.createImageToken ? __native_image.createImageToken(info.handle) : null;
                         self._glTextureId = info.glTexture || 0;
                         self._naturalWidth = info.width;
                         self._naturalHeight = info.height;
@@ -927,10 +956,13 @@
        owning Bitmap is destroyed). Loads still in flight free on arrival. */
     HTMLImageElement.prototype._releaseNativeImage = function() {
         this._released = true;
-        if (this._imageHandle && typeof __native_image !== "undefined" &&
+        if (this._imageToken && typeof __native_image !== "undefined" && __native_image.releaseImageToken) {
+            __native_image.releaseImageToken(this._imageToken);
+        } else if (this._imageHandle && typeof __native_image !== "undefined" &&
             typeof __native_image.freeImage === "function") {
             __native_image.freeImage(this._imageHandle);
         }
+        this._imageToken = null;
         this._imageHandle = 0;
         this._glTextureId = 0;
     };
@@ -1085,10 +1117,18 @@
     };
 
     /* Fallback when nothing can be played: report loadeddata, then ended. */
+    /* A movie that cannot be played "ends" quickly so cutscenes do not hang. A title-screen movie that the game
+       restarts every time it ends would then spin, so the same file ending again soon gets a longer and longer wait. */
+    var _skippedMovies = {};
+
     HTMLVideoElement.prototype._finishAsync = function() {
         if (!this._src || this._finishPending) return;
         this._finishPending = true;
         var self = this;
+        var now = Date.now();
+        var rec = _skippedMovies[this._src] || (_skippedMovies[this._src] = { last: 0, n: 0 });
+        rec.n = (now - rec.last < 15000) ? rec.n + 1 : 0;
+        var endDelay = Math.min(VIDEO_EVENT_DELAY_MS * Math.pow(2, rec.n), 20000);
         setTimeout(function() {
             if (!self._src || self._handle) { self._finishPending = false; return; }
             self.paused = false;
@@ -1097,8 +1137,9 @@
                 self._finishPending = false;
                 self.paused = true;
                 self.ended = true;
+                rec.last = Date.now();
                 self.dispatchEvent(new Event("ended"));
-            }, VIDEO_EVENT_DELAY_MS);
+            }, endDelay);
         }, VIDEO_EVENT_DELAY_MS);
     };
 
@@ -1164,6 +1205,7 @@
             var st = __native_video.getState(el._handle);
             if (!st) continue;
             el.currentTime = st.time;
+            if (el._frameHook) el._frameHook(st);
             if (st.ended && !el.ended) {
                 el.ended = true;
                 el.paused = true;
@@ -1267,6 +1309,8 @@
 
     var _title = "";
     var _allCreatedElements = [_refresherCanvas];
+    var _elemGen = 0;      /* changes whenever an element is added to or removed from the registry */
+    var _tagCache = {};    /* tag name -> { gen, results } */
 
     var document = {
         _listeners: {},
@@ -1306,7 +1350,12 @@
             } else {
                 el = new HTMLElement(tagName);
             }
-            _allCreatedElements.push(el);
+            /* Canvases, images, videos and audio hold big native buffers and are almost never looked up by id or tag
+               name before they are attached; appendChild() registers them when they are. Keeping every one of them in
+               the registry for ever leaked every bitmap of a game that leaves cleaning up to the garbage collector. */
+            if (tag !== "canvas" && tag !== "img" && tag !== "video" && tag !== "audio") {
+                _allCreatedElements.push(el); _elemGen++;
+            }
             return el;
         },
 
@@ -1335,12 +1384,18 @@
         },
 
         getElementsByTagName: function(tag) {
-            var upper = tag.toUpperCase();
+            var upper = String(tag).toUpperCase();
+            if (upper === "HEAD") return _asCollection([_head]);
+            if (upper === "BODY") return _asCollection([_body]);
+            if (upper === "HTML") return _asCollection([_documentElement]);
+            var cached = _tagCache[upper];
+            if (cached && cached.gen === _elemGen) return _asCollection(cached.results.slice());
             var results = [];
             for (var i = 0; i < _allCreatedElements.length; i++) {
                 if (_allCreatedElements[i].tagName === upper) results.push(_allCreatedElements[i]);
             }
-            return results;
+            _tagCache[upper] = { gen: _elemGen, results: results };
+            return _asCollection(results.slice());
         },
 
         getElementsByClassName: function(cls) {
@@ -1664,7 +1719,7 @@
     function _removeFromElementRegistry(el) {
         var idx = _allCreatedElements.indexOf(el);
         if (idx >= 0) {
-            _allCreatedElements.splice(idx, 1);
+            _allCreatedElements.splice(idx, 1); _elemGen++;
         }
     }
     globalThis.__dom_removeFromElementRegistry = _removeFromElementRegistry;
@@ -1746,7 +1801,7 @@
             scriptEl.type = "text/javascript";
             document.currentScript = scriptEl;
             /* Findable via getElementsByTagName("script"). */
-            _allCreatedElements.push(scriptEl);
+            _allCreatedElements.push(scriptEl); _elemGen++;
         } else {
             document.currentScript = null;
         }
@@ -1919,4 +1974,165 @@
         }
     };
 
+})();
+
+/* ---- window globals (browser) that scripts use as plain names ---------------------------------------------------
+   A browser's window has many properties that code reads without "window.": `length` (number of frames), `parent`,
+   `top`, `status`, ... A missing one is a ReferenceError at the first use. Defined only when absent. */
+(function() {
+    "use strict";
+    var g = globalThis;
+
+    function define(name, value) {
+        if (name in g && g[name] !== undefined) return;
+        try {
+            Object.defineProperty(g, name, { value: value, writable: true, configurable: true, enumerable: false });
+        } catch (e) {}
+    }
+
+    define("length", 0);
+    define("status", "");
+    define("defaultStatus", "");
+    define("closed", false);
+    define("parent", g);
+    define("top", g);
+    define("frames", g);
+    define("opener", null);
+    define("origin", "file://");
+    define("event", undefined);
+    if (!("event" in g)) define("event", undefined);
+    define("isSecureContext", true);
+    define("fullScreen", false);
+    define("screenX", 0);
+    define("screenY", 0);
+    define("screenLeft", 0);
+    define("screenTop", 0);
+    define("scrollX", 0);
+    define("scrollY", 0);
+    define("pageXOffset", 0);
+    define("pageYOffset", 0);
+    ["menubar", "toolbar", "statusbar", "personalbar", "locationbar", "scrollbars"].forEach(function(n) {
+        define(n, { visible: false });
+    });
+    define("external", {});
+
+    define("history", {
+        length: 1,
+        state: null,
+        scrollRestoration: "auto",
+        back: function() {},
+        forward: function() {},
+        go: function() {},
+        pushState: function() {},
+        replaceState: function() {}
+    });
+
+    /* sessionStorage: kept in memory for the session */
+    if (typeof g.sessionStorage === "undefined") {
+        var store = {};
+        var session = {
+            getItem: function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+            setItem: function(k, v) { store[String(k)] = String(v); },
+            removeItem: function(k) { delete store[String(k)]; },
+            clear: function() { store = {}; },
+            key: function(i) { var keys = Object.keys(store); return i < keys.length ? keys[i] : null; }
+        };
+        Object.defineProperty(session, "length", { get: function() { return Object.keys(store).length; } });
+        define("sessionStorage", session);
+    }
+
+    /* crypto: random values and UUIDs (no real cryptography) */
+    if (typeof g.crypto === "undefined") {
+        define("crypto", {
+            getRandomValues: function(array) {
+                var bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+                for (var i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+                return array;
+            },
+            randomUUID: function() {
+                return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+                    var r = Math.floor(Math.random() * 16);
+                    return (c === "x" ? r : (r & 3) | 8).toString(16);
+                });
+            },
+            subtle: {}
+        });
+    }
+
+    define("visualViewport", {
+        width: 816, height: 624, scale: 1, offsetLeft: 0, offsetTop: 0, pageLeft: 0, pageTop: 0,
+        addEventListener: function() {}, removeEventListener: function() {}
+    });
+    define("customElements", { define: function() {}, get: function() { return undefined; }, whenDefined: function() { return Promise.resolve(); } });
+    define("scrollBy", function() {});
+    define("stop", function() {});
+    define("find", function() { return false; });
+    define("reportError", function(e) { if (typeof console !== "undefined") console.error(e); });
+
+    define("requestIdleCallback", function(cb) {
+        return setTimeout(function() {
+            cb({ didTimeout: false, timeRemaining: function() { return 10; } });
+        }, 1);
+    });
+    define("cancelIdleCallback", function(id) { clearTimeout(id); });
+
+    define("postMessage", function(message) {
+        setTimeout(function() {
+            try {
+                var ev = typeof Event === "function" ? new Event("message") : { type: "message" };
+                ev.data = message;
+                ev.source = g;
+                if (typeof g.onmessage === "function") g.onmessage(ev);
+                if (typeof g.dispatchEvent === "function") g.dispatchEvent(ev);
+            } catch (e) {}
+        }, 0);
+    });
+
+    /* structuredClone: a deep copy that keeps cycles, dates, maps, sets and typed arrays */
+    if (typeof g.structuredClone === "undefined") {
+        define("structuredClone", function(value) {
+            var seen = new Map();
+            function clone(v) {
+                if (v === null || typeof v !== "object") {
+                    if (typeof v === "function" || typeof v === "symbol") {
+                        var err = new Error("The object can not be cloned.");
+                        err.name = "DataCloneError";
+                        throw err;
+                    }
+                    return v;
+                }
+                if (seen.has(v)) return seen.get(v);
+                var out;
+                if (v instanceof Date) { out = new Date(v.getTime()); seen.set(v, out); return out; }
+                if (v instanceof RegExp) { out = new RegExp(v.source, v.flags); seen.set(v, out); return out; }
+                if (v instanceof ArrayBuffer) { out = v.slice(0); seen.set(v, out); return out; }
+                if (ArrayBuffer.isView(v)) {
+                    var buf = clone(v.buffer);
+                    out = v instanceof DataView ? new DataView(buf, v.byteOffset, v.byteLength)
+                                                : new v.constructor(buf, v.byteOffset, v.length);
+                    seen.set(v, out);
+                    return out;
+                }
+                if (v instanceof Map) {
+                    out = new Map(); seen.set(v, out);
+                    v.forEach(function(val, key) { out.set(clone(key), clone(val)); });
+                    return out;
+                }
+                if (v instanceof Set) {
+                    out = new Set(); seen.set(v, out);
+                    v.forEach(function(val) { out.add(clone(val)); });
+                    return out;
+                }
+                if (Array.isArray(v)) {
+                    out = new Array(v.length); seen.set(v, out);
+                    for (var i = 0; i < v.length; i++) out[i] = clone(v[i]);
+                    return out;
+                }
+                out = {}; seen.set(v, out);
+                Object.keys(v).forEach(function(k) { out[k] = clone(v[k]); });
+                return out;
+            }
+            return clone(value);
+        });
+    }
 })();

@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-GeneralArcade-Commercial
  */
 
+#include "rendering/canvas2d.h"
+#include "engine/js_engine.h"
 #include "bindings/bind_renderer.h"
 #include "rendering/renderer.h"
 #include "rendering/sprite_batch.h"
@@ -32,6 +34,7 @@ Renderer *s_renderer = NULL;
 static JSValue js_renderer_init(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_init");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "init requires width and height");
@@ -53,6 +56,7 @@ static JSValue js_renderer_init(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_shutdown(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_shutdown");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_renderer) {
         renderer_destroy(s_renderer);
@@ -65,6 +69,7 @@ static JSValue js_renderer_shutdown(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_resize(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_resize");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "resize requires width and height");
@@ -81,6 +86,7 @@ static JSValue js_renderer_resize(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_get_size(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_get_size");
     (void)this_val; (void)argc; (void)argv;
     if (!s_renderer) return JS_NULL;
 
@@ -98,6 +104,7 @@ static JSValue js_renderer_get_size(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_begin_frame(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_begin_frame");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_renderer) renderer_begin_frame(s_renderer);
     return JS_UNDEFINED;
@@ -107,6 +114,7 @@ static JSValue js_renderer_begin_frame(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_begin_frame_transparent(JSContext *ctx, JSValueConst this_val,
                                                     int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_begin_frame_transparent");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_renderer) renderer_begin_frame_transparent(s_renderer);
     return JS_UNDEFINED;
@@ -116,6 +124,7 @@ static JSValue js_renderer_begin_frame_transparent(JSContext *ctx, JSValueConst 
 static JSValue js_renderer_end_frame(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_end_frame");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_renderer) renderer_end_frame(s_renderer);
     return JS_UNDEFINED;
@@ -127,6 +136,7 @@ static JSValue js_renderer_end_frame(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_create_texture(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_create_texture");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "createTexture requires width and height");
@@ -146,6 +156,7 @@ static JSValue js_renderer_create_texture(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_update_texture(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_update_texture");
     (void)this_val;
     if (argc < 4)
         return JS_ThrowTypeError(ctx, "updateTexture requires texId, w, h, pixels");
@@ -169,10 +180,74 @@ static JSValue js_renderer_update_texture(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* updateTextureFromCanvas(texId, w, h, canvasHandle) -> bool: uploads a canvas's pixels straight from its own
+   buffer. getPixels() + updateTexture() copies the whole canvas into a fresh ArrayBuffer first, which for the
+   screen-sized canvases of lighting plugins is several megabytes per upload. False: sizes do not match. */
+static JSValue js_renderer_update_texture_from_canvas(JSContext *ctx, JSValueConst this_val,
+                                                      int argc, JSValueConst *argv)
+{
+    RMMZ_PROF_SCOPE("renderer.renderer_update_texture");
+    (void)this_val;
+    if (argc < 4)
+        return JS_ThrowTypeError(ctx, "updateTextureFromCanvas requires texId, w, h, canvasHandle");
+
+    uint32_t tex, handle;
+    int w, h;
+    if (JS_ToUint32(ctx, &tex, argv[0])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &w, argv[1])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &h, argv[2])) return JS_EXCEPTION;
+    if (JS_ToUint32(ctx, &handle, argv[3])) return JS_EXCEPTION;
+
+    int cw = 0, ch = 0;
+    if (!canvas2d_get_size(handle, &cw, &ch) || cw != w || ch != h) return JS_FALSE;
+    if (w <= 0 || h <= 0 || w > MAX_PIXEL_DIM || h > MAX_PIXEL_DIM) return JS_FALSE;
+    uint8_t *pixels = canvas2d_get_pixels(handle);
+    if (!pixels) return JS_FALSE;
+    renderer_update_texture(tex, w, h, pixels);
+    return JS_TRUE;
+}
+
+/* Texture tokens: createTextureToken(textureId) returns an object that deletes the texture when the engine
+   frees it (at the start of the next frame), so textures of script objects nobody frees explicitly (RPG Maker MV
+   leaves its bitmaps to the garbage collector) do not pile up. releaseTextureToken(token) deletes the texture right
+   away and disarms the token. */
+static JSClassID texture_token_class_id;
+
+static void texture_token_finalizer(JSRuntime *rt, JSValue val)
+{
+    (void)rt;
+    uint32_t tex = (uint32_t)(uintptr_t)JS_GetOpaque(val, texture_token_class_id);
+    if (tex) renderer_queue_texture_delete(tex);
+}
+
+static JSValue js_renderer_create_texture_token(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    uint32_t tex = 0;
+    if (argc < 1 || JS_ToUint32(ctx, &tex, argv[0])) return JS_EXCEPTION;
+    JSValue obj = JS_NewObjectClass(ctx, (int)texture_token_class_id);
+    if (JS_IsException(obj)) return obj;
+    JS_SetOpaque(obj, (void *)(uintptr_t)tex);
+    return obj;
+}
+
+static JSValue js_renderer_release_texture_token(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)ctx;
+    if (argc < 1) return JS_UNDEFINED;
+    uint32_t tex = (uint32_t)(uintptr_t)JS_GetOpaque(argv[0], texture_token_class_id);
+    if (tex) {
+        JS_SetOpaque(argv[0], NULL);
+        renderer_delete_texture(tex);
+    }
+    return JS_UNDEFINED;
+}
+
 /* deleteTexture(textureId) */
 static JSValue js_renderer_delete_texture(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_delete_texture");
     (void)this_val;
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "deleteTexture requires textureId");
@@ -189,6 +264,7 @@ static JSValue js_renderer_delete_texture(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_create_rt(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_create_rt");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "createRenderTexture requires width and height");
@@ -213,6 +289,7 @@ static JSValue js_renderer_create_rt(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_delete_rt(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_delete_rt");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "deleteRenderTexture requires fbo and texture");
@@ -228,6 +305,7 @@ static JSValue js_renderer_delete_rt(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_bind_rt(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_bind_rt");
     (void)this_val;
     if (argc < 3)
         return JS_ThrowTypeError(ctx, "bindRenderTexture requires fbo, width, height");
@@ -246,6 +324,7 @@ static JSValue js_renderer_bind_rt(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_unbind_rt(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_unbind_rt");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_renderer) renderer_unbind_fbo(s_renderer);
     return JS_UNDEFINED;
@@ -257,6 +336,7 @@ static JSValue js_renderer_unbind_rt(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_draw_quad(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_draw_quad");
     (void)this_val;
     if (argc < 11)
         return JS_ThrowTypeError(ctx, "drawQuad requires 11 arguments");
@@ -293,6 +373,7 @@ static JSValue js_renderer_draw_quad(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_draw_quad_verts(JSContext *ctx, JSValueConst this_val,
                                            int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_draw_quad_verts");
     (void)this_val;
     if (argc < 15)
         return JS_ThrowTypeError(ctx, "drawQuadVertices requires 15 arguments");
@@ -330,6 +411,7 @@ static JSValue js_renderer_draw_quad_verts(JSContext *ctx, JSValueConst this_val
 static JSValue js_renderer_draw_quad_verts_uv(JSContext *ctx, JSValueConst this_val,
                                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_draw_quad_verts_uv");
     (void)this_val;
     if (argc < 19)
         return JS_ThrowTypeError(ctx, "drawQuadVerticesUV requires 19 arguments");
@@ -362,6 +444,7 @@ static JSValue js_renderer_draw_quad_verts_uv(JSContext *ctx, JSValueConst this_
 static JSValue js_renderer_set_texture_filter(JSContext *ctx, JSValueConst this_val,
                                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_set_texture_filter");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "setTextureFilter requires texture and linear");
@@ -377,6 +460,7 @@ static JSValue js_renderer_set_texture_filter(JSContext *ctx, JSValueConst this_
 static JSValue js_renderer_flush(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_flush");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_renderer) {
         SpriteBatch *batch = renderer_get_batch(s_renderer);
@@ -389,6 +473,7 @@ static JSValue js_renderer_flush(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_set_blend(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_set_blend");
     (void)this_val;
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "setBlendMode requires mode");
@@ -406,6 +491,7 @@ static JSValue js_renderer_set_blend(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_draw_calls(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_draw_calls");
     (void)this_val; (void)argc; (void)argv;
     if (!s_renderer) return JS_NewInt32(ctx, 0);
     SpriteBatch *batch = renderer_get_batch(s_renderer);
@@ -416,6 +502,7 @@ static JSValue js_renderer_draw_calls(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_quad_count(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_quad_count");
     (void)this_val; (void)argc; (void)argv;
     if (!s_renderer) return JS_NewInt32(ctx, 0);
     SpriteBatch *batch = renderer_get_batch(s_renderer);
@@ -426,6 +513,7 @@ static JSValue js_renderer_quad_count(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_rebind_batch(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_rebind_batch");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_renderer) renderer_rebind_batch(s_renderer);
     return JS_UNDEFINED;
@@ -435,6 +523,7 @@ static JSValue js_renderer_rebind_batch(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_set_scissor(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_set_scissor");
     (void)this_val;
     if (argc < 4)
         return JS_ThrowTypeError(ctx, "setScissor requires x, y, w, h");
@@ -458,6 +547,7 @@ static JSValue js_renderer_set_scissor(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_clear_scissor(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_clear_scissor");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (!s_renderer) return JS_UNDEFINED;
 
@@ -472,6 +562,7 @@ static JSValue js_renderer_clear_scissor(JSContext *ctx, JSValueConst this_val,
 static JSValue js_renderer_set_screen_viewport(JSContext *ctx, JSValueConst this_val,
                                                 int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_set_screen_viewport");
     (void)this_val;
     if (argc < 4)
         return JS_ThrowTypeError(ctx, "setScreenViewport requires x, y, w, h");
@@ -490,6 +581,7 @@ static JSValue js_renderer_set_screen_viewport(JSContext *ctx, JSValueConst this
 static JSValue js_renderer_read_pixels(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("renderer.renderer_read_pixels");
     (void)this_val;
     if (argc < 3)
         return JS_ThrowTypeError(ctx, "readPixels requires fbo, width, height");
@@ -525,7 +617,10 @@ static const JSCFunctionListEntry js_renderer_funcs[] = {
     JS_CFUNC_DEF("endFrame",            0, js_renderer_end_frame),
     JS_CFUNC_DEF("createTexture",       2, js_renderer_create_texture),
     JS_CFUNC_DEF("updateTexture",       4, js_renderer_update_texture),
+    JS_CFUNC_DEF("updateTextureFromCanvas", 4, js_renderer_update_texture_from_canvas),
     JS_CFUNC_DEF("deleteTexture",       1, js_renderer_delete_texture),
+    JS_CFUNC_DEF("createTextureToken",  1, js_renderer_create_texture_token),
+    JS_CFUNC_DEF("releaseTextureToken", 1, js_renderer_release_texture_token),
     JS_CFUNC_DEF("setTextureFilter",    2, js_renderer_set_texture_filter),
     JS_CFUNC_DEF("createRenderTexture", 2, js_renderer_create_rt),
     JS_CFUNC_DEF("deleteRenderTexture", 2, js_renderer_delete_rt),
@@ -547,6 +642,13 @@ static const JSCFunctionListEntry js_renderer_funcs[] = {
 
 void bind_renderer_register(JSContext *ctx)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    if (!texture_token_class_id) {
+        static const JSClassDef token_def = { "TextureToken", texture_token_finalizer, NULL, NULL, NULL };
+        JS_NewClassID(rt, &texture_token_class_id);
+        JS_NewClass(rt, texture_token_class_id, &token_def);
+    }
+
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue obj = JS_NewObject(ctx);
 

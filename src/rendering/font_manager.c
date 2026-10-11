@@ -12,7 +12,7 @@
 
 #include "stb_truetype.h"
 
-#define MAX_FONTS 64
+#define MAX_FONTS 512
 
 typedef struct {
     char            *family;     /* Font family name (owned). */

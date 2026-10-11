@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-GeneralArcade-Commercial
  */
 
+#include "engine/js_engine.h"
 #include "bindings/bind_image.h"
 #include "rendering/image_loader.h"
 #include "rendering/apng.h"
@@ -50,6 +51,7 @@ static JSValue make_image_result(JSContext *ctx, ImageHandle handle)
 static JSValue js_load_image(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.load_image");
     (void)this_val;
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "loadImage requires a path argument");
@@ -76,6 +78,7 @@ static JSValue js_load_image(JSContext *ctx, JSValueConst this_val,
 static JSValue js_load_image_from_memory(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.load_image_from_memory");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "loadImageFromMemory requires key and ArrayBuffer");
@@ -104,6 +107,7 @@ static JSValue js_load_image_from_memory(JSContext *ctx, JSValueConst this_val,
 static JSValue js_get_image_info(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.get_image_info");
     (void)this_val;
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "getImageInfo requires a handle argument");
@@ -128,6 +132,7 @@ static JSValue js_get_image_info(JSContext *ctx, JSValueConst this_val,
 static JSValue js_get_image_pixels(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.get_image_pixels");
     (void)this_val;
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "getImagePixels requires a handle argument");
@@ -150,10 +155,45 @@ static JSValue js_get_image_pixels(JSContext *ctx, JSValueConst this_val,
     return JS_NewArrayBufferCopy(ctx, pixels, byte_size);
 }
 
+/* Image tokens, like the canvas and texture tokens: createImageToken(handle) returns an object that frees the image when the
+   engine frees it; releaseImageToken(token) frees it right away and disarms the token. */
+static JSClassID image_token_class_id;
+
+static void image_token_finalizer(JSRuntime *rt, JSValue val)
+{
+    (void)rt;
+    uint32_t handle = (uint32_t)(uintptr_t)JS_GetOpaque(val, image_token_class_id);
+    if (handle) image_free(handle);
+}
+
+static JSValue js_create_image_token(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    uint32_t handle = 0;
+    if (argc < 1 || JS_ToUint32(ctx, &handle, argv[0])) return JS_EXCEPTION;
+    JSValue obj = JS_NewObjectClass(ctx, (int)image_token_class_id);
+    if (JS_IsException(obj)) return obj;
+    JS_SetOpaque(obj, (void *)(uintptr_t)handle);
+    return obj;
+}
+
+static JSValue js_release_image_token(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)ctx;
+    if (argc < 1) return JS_UNDEFINED;
+    uint32_t handle = (uint32_t)(uintptr_t)JS_GetOpaque(argv[0], image_token_class_id);
+    if (handle) {
+        JS_SetOpaque(argv[0], NULL);
+        image_free(handle);
+    }
+    return JS_UNDEFINED;
+}
+
 /* freeImage(handle) */
 static JSValue js_free_image(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.free_image");
     (void)this_val;
     if (argc < 1)
         return JS_ThrowTypeError(ctx, "freeImage requires a handle argument");
@@ -170,6 +210,7 @@ static JSValue js_free_image(JSContext *ctx, JSValueConst this_val,
 static JSValue js_cache_count(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.cache_count");
     (void)this_val; (void)argc; (void)argv;
     return JS_NewUint32(ctx, (uint32_t)image_cache_count());
 }
@@ -178,6 +219,7 @@ static JSValue js_cache_count(JSContext *ctx, JSValueConst this_val,
 static JSValue js_clear_cache(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.clear_cache");
     (void)this_val; (void)argc; (void)argv;
     image_cache_clear();
     return JS_UNDEFINED;
@@ -191,6 +233,7 @@ static JSValue js_clear_cache(JSContext *ctx, JSValueConst this_val,
 static JSValue js_decode_apng(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("image.decode_apng");
     (void)this_val;
     if (argc < 1) return JS_ThrowTypeError(ctx, "decodeApng requires an ArrayBuffer");
 
@@ -238,12 +281,21 @@ static const JSCFunctionListEntry js_image_funcs[] = {
     JS_CFUNC_DEF("getImageInfo",        1, js_get_image_info),
     JS_CFUNC_DEF("getImagePixels",      1, js_get_image_pixels),
     JS_CFUNC_DEF("freeImage",           1, js_free_image),
+    JS_CFUNC_DEF("createImageToken",    1, js_create_image_token),
+    JS_CFUNC_DEF("releaseImageToken",   1, js_release_image_token),
     JS_CFUNC_DEF("cacheCount",          0, js_cache_count),
     JS_CFUNC_DEF("clearCache",          0, js_clear_cache),
 };
 
 void bind_image_register(JSContext *ctx)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    if (!image_token_class_id) {
+        static const JSClassDef token_def = { "ImageToken", image_token_finalizer, NULL, NULL, NULL };
+        JS_NewClassID(rt, &image_token_class_id);
+        JS_NewClass(rt, image_token_class_id, &token_def);
+    }
+
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue img_obj = JS_NewObject(ctx);
 

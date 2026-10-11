@@ -102,47 +102,60 @@
                         }
                     }
 
+                    xhr.responseType = "arraybuffer";
                     xhr.onload = function() {
-                        var responseText = xhr.responseText || "";
-                        resolve({
+                        var buf = xhr.response || new ArrayBuffer(0);
+                        var ctype = null;
+                        if (/\.(ogg|oga)(\?|$)/i.test(url)) ctype = "audio/ogg";
+                        else if (/\.json(\?|$)/i.test(url)) ctype = "application/json";
+                        var response = {
                             ok: xhr.status >= 200 && xhr.status < 300,
                             status: xhr.status,
                             statusText: xhr.statusText || "",
+                            url: url,
+                            bodyUsed: false,
                             headers: {
-                                get: function() { return null; }
+                                get: function(name) {
+                                    name = String(name).toLowerCase();
+                                    if (name === "content-length") return String(buf.byteLength);
+                                    if (name === "content-type") return ctype;
+                                    return null;
+                                },
+                                has: function(name) { return this.get(name) !== null; }
                             },
                             text: function() {
-                                return Promise.resolve(responseText);
+                                return Promise.resolve(new TextDecoder("utf-8").decode(new Uint8Array(buf)));
                             },
                             json: function() {
                                 try {
-                                    return Promise.resolve(JSON.parse(responseText));
+                                    return Promise.resolve(JSON.parse(new TextDecoder("utf-8").decode(new Uint8Array(buf))));
                                 } catch (e) {
                                     return Promise.reject(e);
                                 }
                             },
-                            arrayBuffer: function() {
-                                /* Re-read as binary if caller needs an ArrayBuffer. */
-                                var binXhr = new XMLHttpRequest();
-                                binXhr.open("GET", url);
-                                binXhr.responseType = "arraybuffer";
-                                return new Promise(function(res, rej) {
-                                    binXhr.onload = function() { res(binXhr.response); };
-                                    binXhr.onerror = function() { rej(new Error("arrayBuffer fetch failed")); };
-                                    binXhr.send();
-                                });
-                            },
-                            blob: function() {
-                                var binXhr = new XMLHttpRequest();
-                                binXhr.open("GET", url);
-                                binXhr.responseType = "arraybuffer";
-                                return new Promise(function(res, rej) {
-                                    binXhr.onload = function() { res(new Blob([binXhr.response])); };
-                                    binXhr.onerror = function() { rej(new Error("blob fetch failed")); };
-                                    binXhr.send();
-                                });
+                            arrayBuffer: function() { return Promise.resolve(buf.slice(0)); },
+                            blob: function() { return Promise.resolve(new Blob([buf])); },
+                            clone: function() { return response; },
+                            /* body.getReader(): the data in chunks, like a ReadableStream (streaming audio plugins read this way) */
+                            body: {
+                                getReader: function() {
+                                    var pos = 0, chunk = 65536;
+                                    return {
+                                        read: function() {
+                                            if (pos >= buf.byteLength) return Promise.resolve({ done: true, value: undefined });
+                                            var end = Math.min(buf.byteLength, pos + chunk);
+                                            var value = new Uint8Array(buf.slice(pos, end));
+                                            pos = end;
+                                            return Promise.resolve({ done: false, value: value });
+                                        },
+                                        cancel: function() { pos = buf.byteLength; return Promise.resolve(); },
+                                        releaseLock: function() {},
+                                        closed: Promise.resolve()
+                                    };
+                                }
                             }
-                        });
+                        };
+                        resolve(response);
                     };
 
                     xhr.onerror = function() {
@@ -183,7 +196,7 @@
     if (typeof globalThis.require === "function") {
         var _origRequire = globalThis.require;
         globalThis.require = function(moduleName) {
-            if (moduleName === "./greenworks" || moduleName === "greenworks") {
+            if (/greenworks/i.test(String(moduleName))) { /* "greenworks", "./greenworks", "./greenworks/greenworks", ... */
                 var steamId = {
                     screenName: "Player", steamId: "0", accountId: 0, staticAccountId: "0",
                     isIndividualAccount: true, level: 0, getPersonaName: function() { return "Player"; }
@@ -422,17 +435,60 @@
        through RegExp.prototype.exec, so wrapping it is sufficient. */
 
     if (typeof RegExp.$1 === "undefined") {
+        /* Replacing RegExp.prototype.exec would make every String.prototype.replace/split/match take the
+           engine's slow generic path (it must then look up exec and flags for each match), which costs a
+           lot in games that parse text with regular expressions all the time. So exec is left alone and
+           the two operations plugins actually read RegExp.$1 after, test() and match(), are wrapped. */
         var _nativeExec = RegExp.prototype.exec;
+        var _nativeTest = RegExp.prototype.test;
+        var _nativeMatch = String.prototype.match;
         var _lastMatch = null;
         var _lastInput = "";
 
-        RegExp.prototype.exec = function(str) {
-            var m = _nativeExec.call(this, str);
-            if (m) {
-                _lastMatch = m;
-                _lastInput = String(str);
+        RegExp.prototype.test = function(str) {
+            var r = _nativeTest.call(this, str);
+            if (r && this instanceof RegExp) {
+                /* A second, unobserved exec provides the groups; lastIndex is put back so that global and
+                   sticky expressions behave exactly as with the plain test(). */
+                var stateful = this.global || this.sticky;
+                var after = stateful ? this.lastIndex : 0;
+                if (stateful) {
+                    /* lastIndex before the test is unknown here; re-running from the recorded start is not
+                       possible, so skip the record for stateful expressions. */
+                    return r;
+                }
+                var m = _nativeExec.call(this, str);
+                if (m) {
+                    _lastMatch = m;
+                    _lastInput = String(str);
+                }
             }
-            return m;
+            return r;
+        };
+
+        String.prototype.match = function(re) {
+            /* A non-global match() is just exec(); going through the engine's own match() also reads the
+               regexp's `flags` property (eight getter calls), which is slow and text-heavy plugins do it
+               constantly. */
+            if (arguments.length === 1 && re instanceof RegExp && !re.global && this !== null && this !== undefined) {
+                var one = _nativeExec.call(re, String(this));
+                if (one) {
+                    _lastMatch = one;
+                    _lastInput = String(this);
+                }
+                return one;
+            }
+            var r = _nativeMatch.apply(this, arguments);
+            if (r && re instanceof RegExp) {
+                if (re.global) {
+                    _lastMatch = [r[r.length - 1]];
+                    _lastMatch.index = 0;
+                } else {
+                    _lastMatch = r;
+                }
+                _lastInput = String(this);
+            }
+            return r;
         };
 
         var _defineStatic = function(names, getter) {
@@ -471,4 +527,25 @@
         });
     }
 
+})();
+
+/* The game's resolution goes to the platform (see platform_set_virtual_size): on the PS5 the game is drawn at
+   its own size and scaled to the screen once, which is a lot less work than drawing at 1080p. */
+(function() {
+    if (typeof __native_platform === "undefined" || !__native_platform.setVirtualSize) return;
+    var lastW = 0, lastH = 0;
+    function check() {
+        try {
+            if (typeof Graphics !== "undefined" && Graphics.width > 0 && Graphics.height > 0) {
+                var w = Graphics.width | 0, h = Graphics.height | 0;
+                if (w !== lastW || h !== lastH) {
+                    lastW = w;
+                    lastH = h;
+                    __native_platform.setVirtualSize(w, h);
+                }
+            }
+        } catch (e) { /* the game is not up yet */ }
+        requestAnimationFrame(check);
+    }
+    requestAnimationFrame(check);
 })();

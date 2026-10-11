@@ -1,0 +1,9 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 the PS5 port contributors */
+/* The executable exports its symbols so that libOSMesa.so (loaded with dlopen) can import libc functions
+   from it. The gl* wrappers in src/rendering/gl_ps5.c must NOT be exported: OSMesa would resolve its own
+   gl* entry points to them and the wrappers would call themselves forever. */
+{
+    global: *;
+    local: gl[A-Z]*;
+};

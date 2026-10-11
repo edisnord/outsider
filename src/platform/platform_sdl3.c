@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 #ifdef RMMZ_RENDER_GPU
 #include "rendering/gpu_backend.h"
+#include "rendering/renderer.h"
 #else
 #include "rendering/gl_loader.h"
 #endif
@@ -27,6 +28,19 @@ struct Platform {
     bool  resize_pending;
     int   resize_w;
     int   resize_h;
+
+#ifdef RMMZ_PS5
+    /* Pad buttons that press keys (the launcher's settings) */
+    bool  kb_down[12];
+    /* The DualSense touchpad as a mouse */
+    int   tp_handle, tp_tries;
+    bool  tp_active, tp_moved, tp_press, tp_press_used;
+    int   tp_prev_x, tp_prev_y, tp_start_x, tp_start_y, tp_maxfingers, tp_button;
+    Uint64 tp_start_ms, cursor_until;
+    float cur_x, cur_y;
+    uint32_t cursor_tex;
+    int   cursor_scale;
+#endif
 };
 
 /* SDL keycode -> DOM keyCode */
@@ -338,6 +352,347 @@ static void process_mouse_wheel(const SDL_MouseWheelEvent *wev)
     input_manager_push_event(&ev);
 }
 
+#ifdef RMMZ_PS5
+/* ---- PlayStation 5 (Vulkan build) -------------------------------------------------------
+   As in the SDL2 port (platform_sdl2.c): the launcher's Settings screen writes $HOME/settings.ini (or the file
+   RMMZ_SETTINGS names) with the pad buttons' mapping, keys that pad buttons press, the pointer speed and the
+   scaling; the DualSense touchpad drives a mouse pointer. */
+
+#define SETTINGS_PAD_BUTTONS 12
+/* order as in the launcher: cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad */
+static int settings_map[SETTINGS_PAD_BUTTONS] = { 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 9, 8 };
+static const SDL_GamepadButton settings_buttons[SETTINGS_PAD_BUTTONS] = {
+    SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH,
+    SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+    SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_BUTTON_INVALID,   /* L2 and R2 are analog */
+    SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK,
+    SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_TOUCHPAD,
+};
+static const char *const settings_keys[SETTINGS_PAD_BUTTONS] = {
+    "cross", "circle", "square", "triangle", "l1", "r1", "l2", "r2", "l3", "r3", "options", "touchpad",
+};
+static float settings_pointer_gain = 1.6f;
+static int settings_key[SETTINGS_PAD_BUTTONS] = { 90, 88 };   /* DOM key code a pad button also presses, 0 = none; by default Cross presses Z and Circle presses X */
+
+static void load_settings(void)
+{
+    const char *path = getenv("RMMZ_SETTINGS");
+    char buf[512];
+    if (!path || !*path) {
+        const char *home = getenv("HOME");
+        snprintf(buf, sizeof(buf), "%s/settings.ini", home ? home : ".");
+        path = buf;
+    }
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        int value = atoi(eq + 1);
+        if (strncmp(line, "map.", 4) == 0) {
+            for (int i = 0; i < SETTINGS_PAD_BUTTONS; i++)
+                if (strcmp(line + 4, settings_keys[i]) == 0 && value >= -1 && value < 12) settings_map[i] = value;
+        } else if (strncmp(line, "key.", 4) == 0) {
+            for (int i = 0; i < SETTINGS_PAD_BUTTONS; i++)
+                if (strcmp(line + 4, settings_keys[i]) == 0 && value >= 0 && value < 256) settings_key[i] = value;
+        } else if (strcmp(line, "pointer") == 0) {
+            static const float gains[3] = { 1.0f, 1.6f, 2.4f };
+            if (value >= 0 && value <= 2) settings_pointer_gain = gains[value];
+        }
+        /* "scale" (sharp or smooth upscaling) is the OpenGL builds' own: here the game is drawn at the size of the
+           screen */
+    }
+    fclose(f);
+}
+
+static bool ps5_pad_down(SDL_Gamepad *gp, int i, double lt, double rt, double *value)
+{
+    *value = 1.0;
+    if (i == 6) { *value = lt; return lt > 0.5; }
+    if (i == 7) { *value = rt; return rt > 0.5; }
+    return SDL_GetGamepadButton(gp, settings_buttons[i]);
+}
+
+/* The W3C state of a pad, with the face, shoulder, trigger, stick and Options buttons assigned by the settings
+   (settings_map[i]: the virtual button pad button i triggers, -1 for none). The D-pad and Guide keep their
+   places. */
+static void ps5_fill_gamepad_buttons(SDL_Gamepad *gp, GamepadState *state)
+{
+    static const SDL_GamepadButton fixed[] = {
+        SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN, SDL_GAMEPAD_BUTTON_DPAD_LEFT,
+        SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_GUIDE,
+    };
+    for (int b = 12; b < INPUT_GAMEPAD_BUTTONS && b - 12 < (int)SDL_arraysize(fixed); b++) {
+        bool pressed = SDL_GetGamepadButton(gp, fixed[b - 12]);
+        state->buttons[b].pressed = pressed;
+        state->buttons[b].value = pressed ? 1.0 : 0.0;
+    }
+    double lt = (double)SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0;
+    double rt = (double)SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 32767.0;
+    for (int i = 0; i < SETTINGS_PAD_BUTTONS; i++) {
+        int target = settings_map[i];
+        double value;
+        if (target < 0 || !ps5_pad_down(gp, i, lt, rt, &value)) continue;
+        state->buttons[target].pressed = true;
+        if (value > state->buttons[target].value) state->buttons[target].value = value;
+    }
+}
+
+/* Pad buttons that press keyboard keys: some PC games read the keyboard directly ("press E", Shift, F-keys). */
+static bool dom_key_names(int code, const char **key, const char **dom_code)
+{
+    static char key_buf[8], code_buf[16];
+    if (code >= 65 && code <= 90) {
+        snprintf(key_buf, sizeof(key_buf), "%c", 'a' + (code - 65));
+        snprintf(code_buf, sizeof(code_buf), "Key%c", code);
+        *key = key_buf; *dom_code = code_buf;
+        return true;
+    }
+    if (code >= 48 && code <= 57) {
+        snprintf(key_buf, sizeof(key_buf), "%c", code);
+        snprintf(code_buf, sizeof(code_buf), "Digit%c", code);
+        *key = key_buf; *dom_code = code_buf;
+        return true;
+    }
+    if (code >= 112 && code <= 123) {
+        snprintf(key_buf, sizeof(key_buf), "F%d", code - 111);
+        snprintf(code_buf, sizeof(code_buf), "F%d", code - 111);
+        *key = key_buf; *dom_code = code_buf;
+        return true;
+    }
+    switch (code) {
+        case 8:  *key = "Backspace";  *dom_code = "Backspace";    return true;
+        case 9:  *key = "Tab";        *dom_code = "Tab";          return true;
+        case 13: *key = "Enter";      *dom_code = "Enter";        return true;
+        case 16: *key = "Shift";      *dom_code = "ShiftLeft";    return true;
+        case 17: *key = "Control";    *dom_code = "ControlLeft";  return true;
+        case 18: *key = "Alt";        *dom_code = "AltLeft";      return true;
+        case 27: *key = "Escape";     *dom_code = "Escape";       return true;
+        case 32: *key = " ";          *dom_code = "Space";        return true;
+        case 33: *key = "PageUp";     *dom_code = "PageUp";       return true;
+        case 34: *key = "PageDown";   *dom_code = "PageDown";     return true;
+        case 35: *key = "End";        *dom_code = "End";          return true;
+        case 36: *key = "Home";       *dom_code = "Home";         return true;
+        case 37: *key = "ArrowLeft";  *dom_code = "ArrowLeft";    return true;
+        case 38: *key = "ArrowUp";    *dom_code = "ArrowUp";      return true;
+        case 39: *key = "ArrowRight"; *dom_code = "ArrowRight";   return true;
+        case 40: *key = "ArrowDown";  *dom_code = "ArrowDown";    return true;
+        case 45: *key = "Insert";     *dom_code = "Insert";       return true;
+        case 46: *key = "Delete";     *dom_code = "Delete";       return true;
+        default: return false;
+    }
+}
+
+static void push_key(int code, bool down)
+{
+    const char *key, *dom_code;
+    if (!dom_key_names(code, &key, &dom_code)) return;
+    InputEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = down ? INPUT_KEY_DOWN : INPUT_KEY_UP;
+    ev.keyCode = code;
+    strncpy(ev.key, key, sizeof(ev.key) - 1);
+    strncpy(ev.code, dom_code, sizeof(ev.code) - 1);
+    if (code == 16) ev.shiftKey = down;
+    if (code == 17) ev.ctrlKey = down;
+    if (code == 18) ev.altKey = down;
+    input_manager_push_event(&ev);
+}
+
+static void update_key_bindings(Platform *p)
+{
+    SDL_Gamepad *gp = NULL;
+    for (int i = 0; i < INPUT_MAX_GAMEPADS && !gp; i++) gp = p->gamepads[i];
+    if (!gp) return;
+    double lt = (double)SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0;
+    double rt = (double)SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 32767.0;
+    for (int i = 0; i < SETTINGS_PAD_BUTTONS; i++) {
+        double value;
+        if (settings_key[i] == 0) continue;
+        bool down = ps5_pad_down(gp, i, lt, rt, &value);
+        if (down != p->kb_down[i]) {
+            p->kb_down[i] = down;
+            push_key(settings_key[i], down);
+        }
+    }
+}
+
+/* The touchpad: one finger moves a pointer (relative, like a laptop touchpad), a tap or a press of the touchpad
+   clicks, and the same with two fingers is a right click (cancel in RPG Maker). The pad API reports the fingers;
+   SDL's joystick driver opened the pad, and scePadGetHandle finds its handle. */
+typedef struct { uint16_t x, y; uint8_t finger, pad[3]; } PadTouch;
+typedef struct { uint8_t fingers, pad1[3]; uint32_t pad2; PadTouch touch[2]; } PadTouchData;
+typedef struct {
+    uint32_t buttons;
+    struct { uint8_t x, y; } leftStick, rightStick;
+    struct { uint8_t l2, r2; } analogButtons;
+    uint16_t padding;
+    struct { float x, y, z, w; } quat;
+    struct { float x, y, z; } vel, acell;
+    PadTouchData touch;
+    uint8_t connected;
+    uint64_t timestamp;
+    uint8_t ext[16];
+    uint8_t count;
+    uint8_t unknown[15];
+} PadData;
+
+extern int scePadGetHandle(int user_id, int type, int index);
+extern int scePadReadState(int handle, PadData *data);
+extern int sceUserServiceGetLoginUserIdList(int user_ids[4]);
+
+#define TP_BUTTON_PRESS 0x100000u
+
+/* Mouse events carry window pixels, as SDL's do; the game maps them into its letterboxed picture */
+static void push_mouse(InputEventType type, int x, int y, int button)
+{
+    InputEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = type;
+    ev.mouseX = x;
+    ev.mouseY = y;
+    ev.button = button;
+    input_manager_push_event(&ev);
+}
+
+static void touchpad_update(Platform *p)
+{
+    if (p->tp_handle < 0) {
+        if ((p->tp_tries++ % 120) != 0) return;       /* look for the pad about twice a second */
+        int ids[4] = { -1, -1, -1, -1 };
+        if (sceUserServiceGetLoginUserIdList(ids) != 0) return;
+        for (int i = 0; i < 4 && p->tp_handle < 0; i++) {
+            if (ids[i] == -1) continue;
+            int h = scePadGetHandle(ids[i], 0, 0);
+            if (h >= 0) p->tp_handle = h;
+        }
+        if (p->tp_handle < 0) return;
+    }
+
+    PadData d;
+    memset(&d, 0, sizeof(d));
+    if (scePadReadState(p->tp_handle, &d) != 0) {
+        p->tp_handle = -1;
+        return;
+    }
+
+    int win_w = 1920, win_h = 1080;
+    SDL_GetWindowSize(p->window, &win_w, &win_h);
+    /* the touchpad's units are about a 1080p screen's pixels */
+    float gain = settings_pointer_gain * (float)win_h / 1080.0f;
+    Uint64 now = SDL_GetTicks();
+    int nf = d.touch.fingers > 2 ? 2 : d.touch.fingers;
+    bool press = (d.buttons & TP_BUTTON_PRESS) != 0;
+
+    if (nf > 0) {
+        int x = d.touch.touch[0].x, y = d.touch.touch[0].y;
+        p->cursor_until = now + 4000;
+        if (!p->tp_active) {
+            p->tp_active = true;
+            p->tp_prev_x = p->tp_start_x = x;
+            p->tp_prev_y = p->tp_start_y = y;
+            p->tp_start_ms = now;
+            p->tp_moved = false;
+            p->tp_press_used = false;
+            p->tp_maxfingers = nf;
+        } else {
+            if (nf > p->tp_maxfingers) p->tp_maxfingers = nf;
+            int dx = x - p->tp_prev_x, dy = y - p->tp_prev_y;
+            p->tp_prev_x = x;
+            p->tp_prev_y = y;
+            if (nf == 1 && (dx != 0 || dy != 0)) {
+                p->cur_x += dx * gain;
+                p->cur_y += dy * gain;
+                if (p->cur_x < 0) p->cur_x = 0;
+                if (p->cur_y < 0) p->cur_y = 0;
+                if (p->cur_x > win_w - 1) p->cur_x = (float)(win_w - 1);
+                if (p->cur_y > win_h - 1) p->cur_y = (float)(win_h - 1);
+                push_mouse(INPUT_MOUSE_MOVE, (int)p->cur_x, (int)p->cur_y, 0);
+            }
+            if (abs(x - p->tp_start_x) + abs(y - p->tp_start_y) > 60) p->tp_moved = true;
+        }
+    } else if (p->tp_active) {
+        p->tp_active = false;
+        /* a short touch without moving is a tap */
+        if (!p->tp_moved && !p->tp_press_used && now - p->tp_start_ms < 300) {
+            int button = p->tp_maxfingers >= 2 ? 2 : 0;
+            push_mouse(INPUT_MOUSE_DOWN, (int)p->cur_x, (int)p->cur_y, button);
+            push_mouse(INPUT_MOUSE_UP, (int)p->cur_x, (int)p->cur_y, button);
+        }
+    }
+
+    if (press != p->tp_press) {
+        p->tp_press = press;
+        p->cursor_until = now + 4000;
+        if (press) {
+            p->tp_button = nf >= 2 ? 2 : 0;
+            p->tp_press_used = true;
+            push_mouse(INPUT_MOUSE_DOWN, (int)p->cur_x, (int)p->cur_y, p->tp_button);
+        } else {
+            push_mouse(INPUT_MOUSE_UP, (int)p->cur_x, (int)p->cur_y, p->tp_button);
+        }
+    }
+}
+
+/* The pointer: an arrow drawn over the finished frame (renderer_present_overlay), while the touchpad is in use */
+static const char *const cursor_shape[] = {
+    "X", "XX", "XWX", "XWWX", "XWWWX", "XWWWWX", "XWWWWWX", "XWWWWWWX", "XWWWWWWWX", "XWWWWWWWWX",
+    "XWWWWXXXXX", "XWWXWWX", "XWX XWWX", "XX  XWWX", "X    XWWX", "     XWWX", "      XX",
+};
+#define CURSOR_W 10
+#define CURSOR_H 17
+static Platform *s_overlay_platform;
+
+static void draw_cursor(void)
+{
+    Platform *p = s_overlay_platform;
+    if (!p || SDL_GetTicks() > p->cursor_until) return;
+    if (!p->cursor_tex) {
+        uint8_t px[CURSOR_W * CURSOR_H * 4];
+        memset(px, 0, sizeof(px));
+        for (int row = 0; row < CURSOR_H; row++) {
+            const char *line = cursor_shape[row];
+            for (int col = 0; line[col] && col < CURSOR_W; col++) {
+                if (line[col] == ' ') continue;
+                uint8_t v = line[col] == 'W' ? 255 : 0;
+                uint8_t *o = px + (row * CURSOR_W + col) * 4;   /* first row = the arrow's tip */
+                o[0] = o[1] = o[2] = v;
+                o[3] = 255;
+            }
+        }
+        p->cursor_tex = gpu_texture_create(CURSOR_W, CURSOR_H, false);
+        if (!p->cursor_tex) return;
+        gpu_texture_upload(p->cursor_tex, CURSOR_W, CURSOR_H, px);
+    }
+    int sw = 0, sh = 0;
+    gpu_screen_size(&sw, &sh);
+    if (sw <= 0 || sh <= 0) return;
+    float s = (float)(sh >= 1800 ? 4 : (sh >= 900 ? 2 : 1));
+    /* The screen texture is bottom-up (y = 0 is the bottom row): the arrow's tip at the pointer */
+    float x0 = p->cur_x, x1 = x0 + CURSOR_W * s;
+    float y1 = (float)sh - p->cur_y, y0 = y1 - CURSOR_H * s;
+    GpuVertex v[4] = {
+        { x0, y1, 0.0f, 0.0f, 1, 1, 1, 1 },
+        { x1, y1, 1.0f, 0.0f, 1, 1, 1, 1 },
+        { x1, y0, 1.0f, 1.0f, 1, 1, 1, 1 },
+        { x0, y0, 0.0f, 1.0f, 1, 1, 1, 1 },
+    };
+    float proj[16] = { 0 };
+    proj[0] = 2.0f / (float)sw;
+    proj[5] = 2.0f / (float)sh;
+    proj[10] = -1.0f;
+    proj[12] = -1.0f;
+    proj[13] = -1.0f;
+    proj[15] = 1.0f;
+    gpu_record_target(0, sw, sh);
+    gpu_record_viewport(0, 0, sw, sh);
+    gpu_record_scissor_off();
+    gpu_record_sprites(v, 1, p->cursor_tex, 0 /* BLEND_MODE_NORMAL */, proj, 0.0f);
+}
+#endif /* RMMZ_PS5 */
+
 /* Gamepads */
 
 static int find_gamepad_slot(Platform *p, SDL_JoystickID id)
@@ -440,6 +795,10 @@ static void update_gamepad_state(Platform *p)
             SDL_GAMEPAD_BUTTON_GUIDE,
         };
 
+#ifdef RMMZ_PS5
+        ps5_fill_gamepad_buttons(gp, &state);
+        (void)btn_map;
+#else
         for (int b = 0; b < INPUT_GAMEPAD_BUTTONS; b++) {
             if (btn_map[b] != SDL_GAMEPAD_BUTTON_INVALID) {
                 bool pressed = SDL_GetGamepadButton(gp, btn_map[b]);
@@ -456,6 +815,7 @@ static void update_gamepad_state(Platform *p)
         state.buttons[6].pressed = lt_val > 0.5;
         state.buttons[7].value = rt_val;
         state.buttons[7].pressed = rt_val > 0.5;
+#endif
 
         /* Axes LX, LY, RX, RY normalized to -1..1. */
         static const SDL_GamepadAxis axis_map[] = {
@@ -478,6 +838,9 @@ static void update_gamepad_state(Platform *p)
 
 Platform *platform_init(const char *title, int width, int height)
 {
+#ifdef RMMZ_PS5
+    load_settings();
+#endif
     /* Audio and gamepad are optional (absent in WSL / CI / headless). */
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init(VIDEO) failed: %s\n", SDL_GetError());
@@ -497,9 +860,21 @@ Platform *platform_init(const char *title, int width, int height)
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 #endif
 
+#ifdef RMMZ_PS5
+    /* The console's one window is the whole screen; the game is letterboxed inside it */
+    {
+        const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+        if (mode) {
+            width = mode->w;
+            height = mode->h;
+        }
+    }
+#endif
     SDL_Window *window = SDL_CreateWindow(
         title, width, height,
-#ifdef RMMZ_RENDER_GPU
+#ifdef RMMZ_PS5
+        SDL_WINDOW_FULLSCREEN
+#elif defined(RMMZ_RENDER_GPU)
         SDL_WINDOW_RESIZABLE
 #else
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
@@ -530,9 +905,12 @@ Platform *platform_init(const char *title, int width, int height)
     }
 #endif
 
+#ifndef RMMZ_PS5
     /* Typed text (layout- and IME-aware) for HTML input overlays; key
-       events keep flowing regardless. */
+       events keep flowing regardless. On the console this would open the
+       on-screen keyboard over the game. */
     SDL_StartTextInput(window);
+#endif
 
 #ifndef RMMZ_RENDER_GPU
     /* Windows' opengl32.dll exports only GL 1.1; newer entry points must be
@@ -561,6 +939,13 @@ Platform *platform_init(const char *title, int width, int height)
     }
     p->window = window;
     p->gl_ctx = gl_ctx;
+#ifdef RMMZ_PS5
+    p->tp_handle = -1;
+    p->cur_x = width / 2.0f;
+    p->cur_y = height / 2.0f;
+    s_overlay_platform = p;
+    renderer_present_overlay = draw_cursor;
+#endif
 
     int num_gamepads = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&num_gamepads);
@@ -651,6 +1036,10 @@ bool platform_poll_events(Platform *p)
     }
 
     update_gamepad_state(p);
+#ifdef RMMZ_PS5
+    update_key_bindings(p);
+    touchpad_update(p);
+#endif
 
     return true;
 }
@@ -663,6 +1052,33 @@ void platform_swap_buffers(Platform *p)
        renderer_present; only GL needs the window's buffers swapped. */
     SDL_GL_SwapWindow(p->window);
 #endif
+}
+
+void platform_request_dump(Platform *p, const char *path)
+{
+    (void)p; (void)path;
+}
+
+bool platform_cpu_present_available(Platform *p)
+{
+    (void)p;
+    return false;
+}
+
+bool platform_present_pixels(Platform *p, const uint8_t *rgba, int w, int h)
+{
+    (void)p; (void)rgba; (void)w; (void)h;
+    return false;
+}
+
+void platform_get_present_size(Platform *p, int *w, int *h)
+{
+    platform_get_window_size(p, w, h);
+}
+
+void platform_set_virtual_size(Platform *p, int w, int h)
+{
+    (void)p; (void)w; (void)h;
 }
 
 void platform_get_window_size(Platform *p, int *w, int *h)

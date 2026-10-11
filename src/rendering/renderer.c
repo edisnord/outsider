@@ -15,6 +15,7 @@
 
 #ifdef RMMZ_HAS_GL
 #include "rendering/gl_loader.h"
+#include "engine/error_handler.h"
 #endif
 
 struct Renderer {
@@ -34,6 +35,10 @@ struct Renderer {
     uint32_t     screen_tex;
     int          out_w;
     int          out_h;
+    uint8_t     *readback;    /* renderer_read_screen() buffer */
+    size_t       readback_size;
+    int          pres_w;      /* window size the frame is finally shown in (0: same as out) */
+    int          pres_h;
 };
 
 Renderer *renderer_create(int width, int height)
@@ -159,9 +164,12 @@ static void clear_unscissored(void)
 }
 #endif
 
+static void run_pending_deletes(void);
+
 void renderer_begin_frame(Renderer *r)
 {
     if (!r) return;
+    run_pending_deletes();
 
 #ifdef RMMZ_HAS_GL
     /* When an FBO is bound, renderer_bind_fbo already set its viewport. */
@@ -174,11 +182,13 @@ void renderer_begin_frame(Renderer *r)
 #endif
 
     sprite_batch_begin(r->batch);
+    sprite_batch_set_pristine(r->batch, 1);
 }
 
 void renderer_begin_frame_transparent(Renderer *r)
 {
     if (!r) return;
+    run_pending_deletes();
 
 #ifdef RMMZ_HAS_GL
     if (r->bound_fbo == 0) {
@@ -201,19 +211,101 @@ void renderer_end_frame(Renderer *r)
 
 }
 
+const uint8_t *renderer_read_screen(Renderer *r, int *out_w, int *out_h)
+{
+#ifdef RMMZ_HAS_GL
+    if (!r || !r->screen_fbo || r->out_w <= 0 || r->out_h <= 0) return NULL;
+    size_t need = (size_t)r->out_w * (size_t)r->out_h * 4;
+    if (need > r->readback_size) {
+        uint8_t *bigger = realloc(r->readback, need);
+        if (!bigger) return NULL;
+        r->readback = bigger;
+        r->readback_size = need;
+    }
+    sprite_batch_flush(r->batch);
+    GLint prev_fbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->screen_fbo);
+    glReadPixels(0, 0, r->out_w, r->out_h, GL_RGBA, GL_UNSIGNED_BYTE, r->readback);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+    if (out_w) *out_w = r->out_w;
+    if (out_h) *out_h = r->out_h;
+    return r->readback;
+#else
+    (void)r; (void)out_w; (void)out_h;
+    return NULL;
+#endif
+}
+
+#define PENDING_DELETES 4096
+static uint32_t s_pending_delete[PENDING_DELETES];
+static int      s_pending_delete_count;
+
+void renderer_queue_texture_delete(uint32_t texture)
+{
+    if (!texture) return;
+    if (s_pending_delete_count >= PENDING_DELETES) {
+        renderer_delete_texture(texture);   /* the list is full: better now than never */
+        return;
+    }
+    s_pending_delete[s_pending_delete_count++] = texture;
+}
+
+static void run_pending_deletes(void)
+{
+    for (int i = 0; i < s_pending_delete_count; i++) renderer_delete_texture(s_pending_delete[i]);
+    s_pending_delete_count = 0;
+}
+
+void renderer_set_present_size(Renderer *r, int width, int height)
+{
+    if (!r) return;
+    r->pres_w = width;
+    r->pres_h = height;
+}
+
 void renderer_present(Renderer *r)
 {
     if (!r) return;
 #ifdef RMMZ_HAS_GL
     if (!r->screen_fbo || r->out_w <= 0 || r->out_h <= 0) return;
-    /* A plain blit: the offscreen surface is already the window's size, so
-       there is no scaling and the letterboxing baked into it is preserved. */
     glBindFramebuffer(GL_READ_FRAMEBUFFER, r->screen_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
-    glBlitFramebuffer(0, 0, r->out_w, r->out_h,
-                      0, 0, r->out_w, r->out_h,
-                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    {
+        /* present_log: what is shown where, once per change (a log line says more than a photo of the TV) */
+        static int last[4];
+        if (last[0] != r->out_w || last[1] != r->out_h || last[2] != r->pres_w || last[3] != r->pres_h) {
+            last[0] = r->out_w; last[1] = r->out_h; last[2] = r->pres_w; last[3] = r->pres_h;
+            error_handler_log(LOG_INFO, "present: game picture %dx%d, screen %dx%d", r->out_w, r->out_h, r->pres_w, r->pres_h);
+        }
+    }
+    if (r->pres_w > 0 && r->pres_h > 0 && (r->pres_w != r->out_w || r->pres_h != r->out_h)) {
+        /* The frame was drawn at the game's own size (much less work for the software renderer than drawing
+           it at the size of the screen); scale it up once, keeping the aspect ratio. */
+        float sx = (float)r->pres_w / (float)r->out_w, sy = (float)r->pres_h / (float)r->out_h;
+        float scale = sx < sy ? sx : sy;
+        int dw = (int)((float)r->out_w * scale + 0.5f), dh = (int)((float)r->out_h * scale + 0.5f);
+        int dx = (r->pres_w - dw) / 2, dy = (r->pres_h - dh) / 2;
+        static int filter_mode = -1;   /* -1: undecided, 0: pick by scale, 1: nearest, 2: smooth */
+        if (filter_mode < 0) {
+            const char *e = getenv("RMMZ_SCALE");
+            filter_mode = (e && strcmp(e, "nearest") == 0) ? 1 : ((e && (strcmp(e, "smooth") == 0 || strcmp(e, "linear") == 0)) ? 2 : 0);
+        }
+        int exact = fabsf(scale - roundf(scale)) < 0.001f;
+        GLenum filter = filter_mode == 1 ? GL_NEAREST : (filter_mode == 2 ? GL_LINEAR : (exact ? GL_NEAREST : GL_LINEAR));
+        if (dw != r->pres_w || dh != r->pres_h) {
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        glBlitFramebuffer(0, 0, r->out_w, r->out_h, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, filter);
+    } else {
+        /* A plain blit: the offscreen surface is already the window's size, so there is no scaling and the
+           letterboxing baked into it is preserved. */
+        glBlitFramebuffer(0, 0, r->out_w, r->out_h,
+                          0, 0, r->out_w, r->out_h,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 #endif
 }
@@ -339,6 +431,7 @@ void renderer_bind_fbo(Renderer *r, uint32_t fbo, int width, int height)
 
     /* Flush any pending draws before switching targets. */
     sprite_batch_flush(r->batch);
+    sprite_batch_set_pristine(r->batch, 0);
     r->bound_fbo = fbo;
 
 #ifdef RMMZ_HAS_GL

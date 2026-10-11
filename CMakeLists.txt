@@ -10,6 +10,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+# PlayStation 5 (ps5-payload-sdk): a self-contained build, see cmake/ps5.cmake.
+option(RMMZ_PS5 "Build for the PlayStation 5 with the ps5-payload-sdk" OFF)
+if(RMMZ_PS5)
+    include(cmake/ps5.cmake)
+    return()
+endif()
+
 # Options
 include(CMakeDependentOption)
 option(RMMZ_BUILD_TESTS "Build tests" ON)
@@ -149,6 +156,8 @@ set(RMMZ_RUNTIME_SOURCES
     src/engine/game_loop.c
     src/engine/error_handler.c
     src/engine/script_loader.c
+    src/engine/deobf.c
+    src/rendering/present_cpu.c
     src/io/file_io.c
     src/bindings/bind_io.c
     src/bindings/bind_image.c

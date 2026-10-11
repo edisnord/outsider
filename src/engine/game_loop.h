@@ -19,6 +19,7 @@ typedef struct {
     double jobs_ms;      /* Promise/microtask execution */
     double raf_ms;       /* requestAnimationFrame callbacks (includes rendering) */
     double swap_ms;      /* Buffer swap */
+    double present_ms;   /* Scaling the finished frame to the screen (part of swap) */
     double total_ms;     /* Total frame time */
     int    draw_calls;   /* GPU draw calls this frame */
     int    quad_count;   /* Total quads rendered this frame */

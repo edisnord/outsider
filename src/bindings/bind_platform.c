@@ -77,6 +77,18 @@ static JSValue js_platform_get_window_size(JSContext *ctx, JSValueConst this_val
     return obj;
 }
 
+/* setVirtualSize(width, height): the resolution the game is drawn at (PS5: scaled to the screen) */
+static JSValue js_platform_set_virtual_size(JSContext *ctx, JSValueConst this_val,
+                                            int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (!s_platform || argc < 2) return JS_UNDEFINED;
+    int w, h;
+    if (JS_ToInt32(ctx, &w, argv[0]) || JS_ToInt32(ctx, &h, argv[1])) return JS_EXCEPTION;
+    platform_set_virtual_size(s_platform, w, h);
+    return JS_UNDEFINED;
+}
+
 /* setWindowTitle(title) - window title becomes "<title> [Outsider]", or just
    "Outsider" when the title is empty. Called from the document.title setter. */
 static JSValue js_platform_set_window_title(JSContext *ctx, JSValueConst this_val,
@@ -117,6 +129,7 @@ static const JSCFunctionListEntry js_platform_funcs[] = {
     JS_CFUNC_DEF("getDisplaySize",   0, js_platform_get_display_size),
     JS_CFUNC_DEF("getDisplayScale",  0, js_platform_get_display_scale),
     JS_CFUNC_DEF("getWindowSize",    0, js_platform_get_window_size),
+    JS_CFUNC_DEF("setVirtualSize",   2, js_platform_set_virtual_size),
     JS_CFUNC_DEF("setWindowTitle",   1, js_platform_set_window_title),
     JS_CFUNC_DEF("quit",             0, js_platform_quit),
 };

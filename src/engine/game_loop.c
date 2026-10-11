@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-GeneralArcade-Commercial
  */
 
+#include "engine/js_engine.h"
 #include "engine/game_loop.h"
 #include "engine/error_handler.h"
 #include "audio/audio_engine.h"
@@ -52,6 +53,9 @@ struct GameLoop {
     int           perf_interval;
     int           perf_count;
     GameLoopStats perf_acc;
+    /* Worst frame of the window and how many frames took more than 25 ms: an average hides stutter. */
+    GameLoopStats perf_worst;
+    int           perf_slow_frames;
 
     /* Control mode (--control): commands read from stdin by a thread. */
     bool         control_enabled;
@@ -156,6 +160,8 @@ void game_loop_set_perf_report(GameLoop *loop, int every_frames)
     loop->perf_interval = every_frames > 0 ? every_frames : 0;
     loop->perf_count = 0;
     memset(&loop->perf_acc, 0, sizeof(loop->perf_acc));
+    memset(&loop->perf_worst, 0, sizeof(loop->perf_worst));
+    loop->perf_slow_frames = 0;
 }
 
 void game_loop_set_exit_probe(GameLoop *loop, const char *js_expression)
@@ -444,6 +450,121 @@ void game_loop_request_stop(GameLoop *loop)
     if (loop) loop->running = false;
 }
 
+
+
+/* Benchmark/debug aid: RMMZ_AUTOSCRIPT="<frames>:<javascript>|<frames>:@dump=<file.ppm>|..." runs script code, or has the
+   presented picture written to a file, that many frames after RMMZ_AUTOSTART began (used to reproduce things on the
+   console, where nobody holds the controller). */
+static int script_base = -1;
+
+static void autoscript_step(GameLoop *loop, JSContext *ctx)
+{
+    static const char *spec;
+    static int state = -1;
+    if (state == 0 || script_base < 0) return;
+    if (state < 0) {
+        spec = getenv("RMMZ_AUTOSCRIPT");
+        state = (spec && *spec) ? 1 : 0;
+        if (state == 0) return;
+    }
+    int now = loop->total_frames - script_base;
+    const char *p = spec;
+    static int done_upto = -1;      /* items are handled in order; each once */
+    int index = 0;
+    while (*p) {
+        const char *end = strchr(p, '|');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (index > done_upto) {
+            int frames = atoi(p);
+            const char *colon = memchr(p, ':', len);
+            if (colon && frames <= now) {
+                char item[900];
+                size_t n = len - (size_t)(colon + 1 - p);
+                if (n >= sizeof item) n = sizeof item - 1;
+                memcpy(item, colon + 1, n);
+                item[n] = '\0';
+                if (strncmp(item, "@dump=", 6) == 0) {
+                    platform_request_dump(loop->platform, item + 6);
+                } else {
+                    JSValue v = JS_Eval(ctx, item, n, "<autoscript>", JS_EVAL_TYPE_GLOBAL);
+                    if (JS_IsException(v)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+                    JS_FreeValue(ctx, v);
+                }
+                error_handler_log(LOG_INFO, "autoscript: %d frames: %.60s", frames, item);
+                done_upto = index;
+            } else {
+                break;      /* the next item is not due yet */
+            }
+        }
+        index++;
+        if (!end) break;
+        p = end + 1;
+    }
+}
+
+/* Benchmark aid: RMMZ_AUTOSTART=load[:slot] loads a save; RMMZ_AUTOSTART=<mapId>,<x>,<y> starts a new game as soon as the title screen is up and moves the
+   player there (RMMZ_AUTOSTART=new just starts). Lets the console run a heavy map without anyone at the controller. */
+static void autostart_step(GameLoop *loop, JSContext *ctx)
+{
+    static int state = -1;          /* -1: not read yet, 0: off, 1: waiting for the title, 2: waiting on the map */
+    static const char *spec;
+    static int map_frame;
+    if (state == 0) return;
+    if (state < 0) {
+        spec = getenv("RMMZ_AUTOSTART");
+        state = (spec && *spec) ? 1 : 0;
+        if (state == 0) return;
+    }
+    if (loop->total_frames % 15 != 0) return;
+    if (state == 1) {
+        const char *probe = "typeof SceneManager !== 'undefined' && SceneManager._scene ? SceneManager._scene.constructor.name : ''";
+        JSValue v = JS_Eval(ctx, probe, strlen(probe), "<autostart>", JS_EVAL_TYPE_GLOBAL);
+        const char *name = JS_IsException(v) ? NULL : JS_ToCString(ctx, v);
+        int on_title = name && strcmp(name, "Scene_Title") == 0;
+        if (name) JS_FreeCString(ctx, name);
+        if (JS_IsException(v)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+        JS_FreeValue(ctx, v);
+        int title_mode = strcmp(spec, "title") == 0;
+        /* title mode: games whose "title" is a map (no Scene_Title) start the clock after about 15 s instead */
+        if (!on_title && !(title_mode && loop->total_frames > 900)) return;
+        if (title_mode) {      /* RMMZ_AUTOSTART=title: only start the clock of RMMZ_AUTOSCRIPT */
+            error_handler_log(LOG_INFO, "autostart: title screen reached");
+            script_base = loop->total_frames;
+            state = 0;
+            return;
+        }
+        char go[512];
+        int slot = strncmp(spec, "load", 4) == 0 ? (spec[4] == ':' ? atoi(spec + 5) : 0) : -1;
+        if (slot >= 0)
+            snprintf(go, sizeof go,
+                     "(function(){ var go = function(){ $gameSystem.onAfterLoad(); SceneManager.goto(Scene_Map); };"
+                     " var r = DataManager.loadGame(%d); if (r && typeof r.then === 'function') r.then(go); else if (r) go(); })(); 1", slot);
+        else
+            snprintf(go, sizeof go,
+                     "(function(){ var s = SceneManager._scene;"
+                     " if (s && typeof s.commandNewGame === 'function') s.commandNewGame();"
+                     " else { DataManager.setupNewGame(); SceneManager.goto(Scene_Map); } })(); 1");
+        JS_FreeValue(ctx, JS_Eval(ctx, go, strlen(go), "<autostart>", JS_EVAL_TYPE_GLOBAL));
+        error_handler_log(LOG_INFO, slot >= 0 ? "autostart: loading save %d" : "autostart: new game started", slot);
+        state = slot >= 0 ? 0 : 2;
+        map_frame = loop->total_frames + 150;
+        script_base = loop->total_frames;
+    } else if (state == 2 && loop->total_frames >= map_frame) {
+        int m = 0, x = 0, y = 0;
+        if (sscanf(spec, "%d,%d,%d", &m, &x, &y) == 3) {
+            char code[512];
+            snprintf(code, sizeof code,
+                     "$gameMessage.clear(); $gameScreen.clear(); $gameMap._interpreter.terminate();"
+                     "$gamePlayer.reserveTransfer(%d, %d, %d, 2, 0); $gamePlayer.setTransparent(false); 1", m, x, y);
+            JSValue v = JS_Eval(ctx, code, strlen(code), "<autostart>", JS_EVAL_TYPE_GLOBAL);
+            if (JS_IsException(v)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+            JS_FreeValue(ctx, v);
+            error_handler_log(LOG_INFO, "autostart: moved to map %d (%d,%d)", m, x, y);
+        }
+        state = 0;
+    }
+}
+
 bool game_loop_step(GameLoop *loop)
 {
     if (!loop || !loop->running) return false;
@@ -572,6 +693,8 @@ bool game_loop_step(GameLoop *loop)
 
     /* --- Debug frame limit: capture the final frame before it is swapped --- */
     loop->total_frames++;
+    if (ctx) autostart_step(loop, ctx);
+    if (ctx) autoscript_step(loop, ctx);
     if (loop->max_frames > 0 && loop->total_frames >= loop->max_frames) {
         if (loop->screenshot_path) {
             write_screenshot(loop, loop->screenshot_path);
@@ -608,6 +731,7 @@ bool game_loop_step(GameLoop *loop)
     /* --- Phase 5: Present --- */
     phase_start = phase_end;
 
+    bool presented = false;
     {
         /* The frame was drawn into an offscreen surface; putting it on screen
            is the renderer's job, and the window swap follows it. */
@@ -616,16 +740,27 @@ bool game_loop_step(GameLoop *loop)
             int ww = 0, wh = 0;
             platform_get_window_size(loop->platform, &ww, &wh);
             renderer_set_output_size(r, ww, wh);
-            renderer_present(r);
+            int pw = 0, ph = 0;
+            platform_get_present_size(loop->platform, &pw, &ph);
+            renderer_set_present_size(r, pw, ph);
+            uint64_t present_start = SDL_GetPerformanceCounter();
+            /* PS5: scale and hand over the frame on the CPU; elsewhere (or if that is not possible) blit it through
+               OpenGL and swap the window. */
+            int sw = 0, sh = 0;
+            const uint8_t *frame = platform_cpu_present_available(loop->platform) ? renderer_read_screen(r, &sw, &sh) : NULL;
+            if (frame && platform_present_pixels(loop->platform, frame, sw, sh)) presented = true;
+            else renderer_present(r);
+            loop->stats.present_ms = ticks_to_ms(loop, SDL_GetPerformanceCounter() - present_start);
         }
     }
 
-    platform_swap_buffers(loop->platform);
+    if (!presented) platform_swap_buffers(loop->platform);
 
     phase_end = SDL_GetPerformanceCounter();
     loop->stats.swap_ms = ticks_to_ms(loop, phase_end - phase_start);
 
     loop->stats.total_ms = ticks_to_ms(loop, phase_end - frame_start);
+    rmmz_frame_us = rmmz_prof_now_us();   /* heartbeat for the stall watchdog thread */
 
     /* --- Optional periodic phase report (debug aid) --- */
     if (loop->perf_interval > 0) {
@@ -634,17 +769,25 @@ bool game_loop_step(GameLoop *loop)
         loop->perf_acc.jobs_ms   += loop->stats.jobs_ms;
         loop->perf_acc.raf_ms    += loop->stats.raf_ms;
         loop->perf_acc.swap_ms   += loop->stats.swap_ms;
+        loop->perf_acc.present_ms += loop->stats.present_ms;
         loop->perf_acc.total_ms  += loop->stats.total_ms;
+        if (loop->stats.total_ms > loop->perf_worst.total_ms) loop->perf_worst = loop->stats;
+        if (loop->stats.total_ms > 25.0) loop->perf_slow_frames++;
         if (++loop->perf_count >= loop->perf_interval) {
             double n = (double)loop->perf_count;
             error_handler_log(LOG_INFO,
                 "perf: %d frames avg %.1f ms (events %.1f, timers %.1f, jobs %.1f, "
-                "rAF %.1f, swap %.1f)",
+                "rAF %.1f, swap %.1f of which scaling %.1f); "
+                "worst frame %.1f ms (rAF %.1f, swap %.1f), %d frames over 25 ms",
                 loop->perf_count, loop->perf_acc.total_ms / n,
                 loop->perf_acc.events_ms / n, loop->perf_acc.timers_ms / n,
                 loop->perf_acc.jobs_ms / n, loop->perf_acc.raf_ms / n,
-                loop->perf_acc.swap_ms / n);
+                loop->perf_acc.swap_ms / n, loop->perf_acc.present_ms / n,
+                loop->perf_worst.total_ms, loop->perf_worst.raf_ms, loop->perf_worst.swap_ms,
+                loop->perf_slow_frames);
             memset(&loop->perf_acc, 0, sizeof(loop->perf_acc));
+            memset(&loop->perf_worst, 0, sizeof(loop->perf_worst));
+            loop->perf_slow_frames = 0;
             loop->perf_count = 0;
         }
     }

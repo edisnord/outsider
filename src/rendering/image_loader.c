@@ -4,6 +4,9 @@
  */
 
 #include "rendering/image_loader.h"
+#ifdef RMMZ_HAVE_WEBP
+#include <webp/decode.h>
+#endif
 #include "io/file_io.h"
 
 #include <stdio.h>
@@ -17,6 +20,8 @@
    .png names now and then (Pocket Mirror's perlinNoise.png). */
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
+#define STBI_ONLY_GIF
+#define STBI_ONLY_BMP
 #define STBI_NO_STDIO   /* We handle file I/O ourselves. */
 #include "stb_image.h"
 
@@ -85,7 +90,7 @@ uint32_t image_upload_rgba_texture(const uint8_t *rgba, int width, int height)
 
 static void delete_gl_texture(uint32_t tex)
 {
-    if (tex) renderer_delete_texture(tex);
+    if (tex) renderer_queue_texture_delete(tex);
 }
 
 static CacheEntry *cache_insert(const char *key, uint8_t *pixels,
@@ -167,6 +172,20 @@ void image_loader_shutdown(void)
     image_cache_clear();
 }
 
+/* Decodes PNG/JPEG/GIF/BMP (stb_image) and, when libwebp is built in, WebP. Some games ship WebP pictures under .png
+   names (the browser engine recognises the content, not the name). The result is RGBA, released with free(). */
+static uint8_t *decode_rgba(const uint8_t *data, size_t size, int *w, int *h)
+{
+#ifdef RMMZ_HAVE_WEBP
+    if (size > 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WEBP", 4) == 0) {
+        uint8_t *px = WebPDecodeRGBA(data, size, w, h);
+        if (px) return px;
+    }
+#endif
+    int channels;
+    return stbi_load_from_memory(data, (int)size, w, h, &channels, 4);
+}
+
 ImageHandle image_load(const char *path)
 {
     if (!path) return IMAGE_HANDLE_INVALID;
@@ -190,9 +209,8 @@ ImageHandle image_load(const char *path)
         free(file_data);
         return IMAGE_HANDLE_INVALID;
     }
-    int w, h, channels;
-    uint8_t *pixels = stbi_load_from_memory(file_data, (int)file_size,
-                                            &w, &h, &channels, 4);
+    int w, h;
+    uint8_t *pixels = decode_rgba(file_data, file_size, &w, &h);
     free(file_data);
 
     if (!pixels) {
@@ -225,9 +243,8 @@ ImageHandle image_load_from_memory(const char *key,
     if (!data || size == 0) return IMAGE_HANDLE_INVALID;
     if (size > INT_MAX) return IMAGE_HANDLE_INVALID;
 
-    int w, h, channels;
-    uint8_t *pixels = stbi_load_from_memory(data, (int)size,
-                                            &w, &h, &channels, 4);
+    int w, h;
+    uint8_t *pixels = decode_rgba(data, size, &w, &h);
     if (!pixels) {
         fprintf(stderr, "image_load_from_memory: failed to decode (%s)\n",
                 stbi_failure_reason());

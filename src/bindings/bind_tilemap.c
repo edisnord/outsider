@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-GeneralArcade-Commercial
  */
 
+#include "engine/js_engine.h"
 #include "bindings/bind_tilemap.h"
 #include "rendering/tilemap.h"
 #include "rendering/renderer.h"
@@ -13,11 +14,12 @@
 /* Global renderer, defined in bind_renderer.c; drawTiles uses its sprite batch. */
 extern Renderer *s_renderer;
 
-/* drawTiles(elementsF32, count, textureIds, texWidths, texHeights, numTilesets, offsetX, offsetY) */
+/* drawTiles(elementsF32, count, textureIds, texWidths, texHeights, numTilesets, offsetX, offsetY [, scaleX, scaleY]) */
 
 static JSValue js_tilemap_draw_tiles(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("tilemap.tilemap_draw_tiles");
     (void)this_val;
     if (argc < 8)
         return JS_ThrowTypeError(ctx, "drawTiles requires 8 arguments");
@@ -79,6 +81,16 @@ static JSValue js_tilemap_draw_tiles(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     }
 
+    /* optional args 8 and 9: scale of the layer's world transform (a zoomed map) */
+    double scale_x = 1.0, scale_y = 1.0;
+    if (argc >= 10) {
+        if (JS_ToFloat64(ctx, &scale_x, argv[8]) || JS_ToFloat64(ctx, &scale_y, argv[9])) {
+            if (tilesets != stack_ts) free(tilesets);
+            return JS_EXCEPTION;
+        }
+        if (!(scale_x > 0.0) || !(scale_y > 0.0)) { scale_x = 1.0; scale_y = 1.0; }
+    }
+
     /* arg 0: elementsF32 (ArrayBuffer). Capture the backing pointer only after
        every other argument is converted: those conversions can run user JS
        (valueOf/getters/Proxy traps) that detaches or resizes this buffer. */
@@ -98,7 +110,7 @@ static JSValue js_tilemap_draw_tiles(JSContext *ctx, JSValueConst this_val,
     SpriteBatch *batch = renderer_get_batch(s_renderer);
     if (batch) {
         tilemap_draw_tiles(elements, count, tilesets, num_tilesets,
-                           (float)offset_x, (float)offset_y, batch);
+                           (float)offset_x, (float)offset_y, (float)scale_x, (float)scale_y, batch);
     }
 
     if (tilesets != stack_ts) free(tilesets);

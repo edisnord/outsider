@@ -135,10 +135,34 @@ void renderer_end_frame(Renderer *r)
     sprite_batch_end(r->batch);
 }
 
+void (*renderer_present_overlay)(void);
+
 void renderer_present(Renderer *r)
 {
     (void)r;
+    if (renderer_present_overlay) renderer_present_overlay();
     gpu_frame_present();
+}
+
+void renderer_set_present_size(Renderer *r, int width, int height)
+{
+    /* The screen texture is the window's size already: nothing is scaled at the end */
+    (void)r; (void)width; (void)height;
+}
+
+const uint8_t *renderer_read_screen(Renderer *r, int *out_w, int *out_h)
+{
+    static uint8_t *pixels;
+    int w = 0, h = 0;
+    (void)r;
+    gpu_screen_size(&w, &h);
+    if (w <= 0 || h <= 0) return NULL;
+    free(pixels);
+    pixels = gpu_texture_download(0, w, h);
+    if (!pixels) return NULL;
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return pixels;
 }
 
 void renderer_set_output_size(Renderer *r, int width, int height)
@@ -169,6 +193,11 @@ void renderer_update_texture(uint32_t texture, int width, int height,
 void renderer_set_texture_filter(uint32_t texture, bool linear)
 {
     gpu_texture_set_filter(texture, linear);
+}
+
+void renderer_queue_texture_delete(uint32_t texture)
+{
+    gpu_texture_destroy(texture);
 }
 
 void renderer_delete_texture(uint32_t texture)

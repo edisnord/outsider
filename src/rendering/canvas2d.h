@@ -48,6 +48,8 @@ enum {
     CANVAS2D_COMP_XOR         = 10,
     CANVAS2D_COMP_MULTIPLY    = 11,
     CANVAS2D_COMP_SCREEN      = 12,
+    CANVAS2D_COMP_DIFFERENCE  = 13,
+    CANVAS2D_COMP_SATURATION  = 14,
 };
 
 /* Initialize the Canvas2D subsystem. Call once at startup. */
@@ -92,6 +94,22 @@ void canvas2d_restore(Canvas2DHandle h);
 /* Fill a rectangle with the current fill color. */
 void canvas2d_fill_rect(Canvas2DHandle h, int x, int y, int w, int h2);
 
+/* Fill a rectangle with a gradient. Linear: (p0,p1) -> (p2,p3) is the gradient line. Radial: centre
+   (p0,p1), radii p2 (t = 0) to p3 (t = 1). offsets[i] and rgba[4*i..4*i+3] are the n colour stops,
+   sorted by offset. Pixels are blended like canvas2d_fill_rect (global alpha, composite operation). */
+void canvas2d_fill_gradient_rect(Canvas2DHandle h, int x, int y, int w, int h2, bool radial,
+                                 double p0, double p1, double p2, double p3,
+                                 const double *offsets, const uint8_t *rgba, int n);
+
+/* Fill polygons (nonzero winding, no anti-aliasing). pts holds x,y pairs of all subpaths one after the
+   other, counts[i] is the number of points of subpath i. Clipped to the canvas and, if has_clip, to the
+   given rectangle. gradient_kind: -1 = current fill colour, 0 = linear, 1 = radial (parameters and stops
+   as for canvas2d_fill_gradient_rect). */
+void canvas2d_fill_path(Canvas2DHandle h, const double *pts, const int *counts, int nsub,
+                        bool has_clip, int clip_x, int clip_y, int clip_w, int clip_h,
+                        int gradient_kind, double p0, double p1, double p2, double p3,
+                        const double *offsets, const uint8_t *rgba, int n);
+
 /* Clear a rectangle to transparent black. */
 void canvas2d_clear_rect(Canvas2DHandle h, int x, int y, int w, int h2);
 
@@ -108,6 +126,9 @@ void canvas2d_draw_image(Canvas2DHandle h,
 
 /* Copy a region of the canvas pixel data into `out`.
    `out` must have space for w * h * 4 bytes. */
+/* Adds r, g, b to every pixel's colour channels with clamping (RPG Maker MV Bitmap.adjustTone). */
+void canvas2d_adjust_tone(Canvas2DHandle h, double r, double g, double b);
+
 void canvas2d_get_image_data(Canvas2DHandle h, int x, int y, int w, int h2,
                               uint8_t *out);
 
@@ -132,8 +153,18 @@ void canvas2d_stroke_text(Canvas2DHandle h, const char *text, float x, float y);
 
 /* Measure the width of `text` in pixels using the current font. */
 float canvas2d_measure_text(Canvas2DHandle h, const char *text);
+bool canvas2d_measure_text_bounds(Canvas2DHandle h, const char *text, float out[4]);
 
 /* Return the number of active Canvas2D contexts. */
 size_t canvas2d_context_count(void);
+
+/* Pixel memory (bytes) held by all canvases. */
+size_t canvas2d_bytes_alive(void);
+/* Sizes of the live canvases (diagnostics): fills w/h up to max entries, returns the count. */
+size_t canvas2d_list_sizes(int *w, int *h, size_t max);
+
+/* Runs fn(arg, y0', y1') over the rows [y0, y1), split between the calling thread and helper threads when the job is
+   big (work_px: roughly the number of pixels touched). One caller at a time. */
+void canvas2d_parallel_rows(void (*fn)(void *arg, int y0, int y1), void *arg, int y0, int y1, long work_px);
 
 #endif /* RMMZ_CANVAS2D_H */

@@ -48,6 +48,11 @@ void video_set_loop(VideoHandle h, bool loop);
 void video_set_visible(VideoHandle h, bool visible);
 bool video_get_state(VideoHandle h, VideoState *out);
 
+/* Copies the newest decoded picture into `texture` (a texture of the movie's size made with renderer_create_texture)
+   when there is a newer one than the last copy. Returns true when the texture changed. Used by plugins that show a
+   movie as a picture instead of full screen. */
+bool video_update_texture(VideoHandle h, uint32_t texture);
+
 /* Advance every playing video by dt seconds (decodes frames and audio). */
 void video_player_update(double dt_seconds);
 

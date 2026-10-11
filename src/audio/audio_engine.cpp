@@ -412,6 +412,9 @@ extern "C" AudioSourceHandle audio_load_stream(const char *path)
     return h;
 }
 
+/* stb_vorbis is compiled into libsoloud; only this one function is needed here. */
+extern "C" int stb_vorbis_decode_memory(const unsigned char *mem, int len, int *channels, int *sample_rate, short **output);
+
 extern "C" AudioSourceHandle audio_load_from_memory(const uint8_t *data, uint32_t size)
 {
     if (s_disabled) return 1;
@@ -427,11 +430,34 @@ extern "C" AudioSourceHandle audio_load_from_memory(const uint8_t *data, uint32_
         return AUDIO_SOURCE_INVALID;
     }
 
-    SoLoud::result res = e->wav->loadMem(
-        const_cast<unsigned char *>(data), size,
-        true,  /* copy */
-        true   /* take ownership of the copy */
-    );
+    SoLoud::result res = SoLoud::UNKNOWN_ERROR;
+    if (size > 4 && memcmp(data, "OggS", 4) == 0) {
+        /* SoLoud sizes its buffer from the length the Ogg file claims and then writes whatever the decoder returns;
+           files whose claimed length is too short (some encoders, or files cut by a game's own tools) overflowed
+           the heap and took the whole program down. Decode the file completely here and hand over the result. */
+        int channels = 0, rate = 0;
+        short *pcm = NULL;
+        int frames = stb_vorbis_decode_memory(data, (int)size, &channels, &rate, &pcm);
+        if (frames > 0 && channels > 0 && pcm) {
+            int use = channels > 8 ? 8 : channels;
+            float *planar = new (std::nothrow) float[(size_t)frames * use];
+            if (planar) {
+                for (int c = 0; c < use; c++)
+                    for (int i = 0; i < frames; i++)
+                        planar[(size_t)c * frames + i] = pcm[(size_t)i * channels + c] * (1.0f / 32768.0f);
+                res = e->wav->loadRawWave(planar, (unsigned int)((size_t)frames * use), (float)rate, (unsigned int)use,
+                                          false, true);
+                if (res != SoLoud::SO_NO_ERROR) delete[] planar;
+            }
+        }
+        free(pcm);
+    } else {
+        res = e->wav->loadMem(
+            const_cast<unsigned char *>(data), size,
+            true,  /* copy */
+            true   /* take ownership of the copy */
+        );
+    }
     if (res != SoLoud::SO_NO_ERROR) {
         fprintf(stderr, "audio_load_from_memory: failed (error %d)\n", res);
         delete e->wav;

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-GeneralArcade-Commercial
  */
 
+#include "engine/js_engine.h"
 #include "bindings/bind_filters.h"
 #include "rendering/filters.h"
 #include "engine/error_handler.h"
@@ -25,6 +26,7 @@ static uint32_t s_mask_shader = 0;
 static JSValue js_filters_init(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_init");
     (void)this_val; (void)argc; (void)argv;
     filters_init();
 
@@ -74,6 +76,7 @@ static JSValue js_filters_init(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_shutdown(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_shutdown");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     if (s_color_matrix_shader) { filter_delete_shader(s_color_matrix_shader); s_color_matrix_shader = 0; }
     if (s_blur_shader) { filter_delete_shader(s_blur_shader); s_blur_shader = 0; }
@@ -90,6 +93,7 @@ static JSValue js_filters_shutdown(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_compile(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_compile");
     (void)this_val;
     if (argc < 2)
         return JS_ThrowTypeError(ctx, "compileShader requires vertSrc and fragSrc");
@@ -116,6 +120,7 @@ static JSValue js_filters_compile(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_delete(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_delete");
     (void)this_val;
     if (argc < 1) return JS_UNDEFINED;
     uint32_t id;
@@ -130,6 +135,7 @@ static JSValue js_filters_delete(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_begin(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_begin");
     (void)this_val;
     if (argc < 4)
         return JS_ThrowTypeError(ctx, "beginFilter requires shaderId, inputTexture, w, h");
@@ -149,6 +155,7 @@ static JSValue js_filters_begin(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_uniform_1f(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_uniform_1f");
     (void)this_val;
     if (argc < 3) return JS_UNDEFINED;
 
@@ -168,6 +175,7 @@ static JSValue js_filters_uniform_1f(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_uniform_texture(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_uniform_texture");
     (void)this_val;
     if (argc < 4) return JS_UNDEFINED;
     uint32_t shader, texture;
@@ -188,6 +196,7 @@ static JSValue js_filters_uniform_texture(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_uniform_2f(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_uniform_2f");
     (void)this_val;
     if (argc < 4) return JS_UNDEFINED;
 
@@ -208,6 +217,7 @@ static JSValue js_filters_uniform_2f(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_uniform_4f(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_uniform_4f");
     (void)this_val;
     if (argc < 6) return JS_UNDEFINED;
 
@@ -230,6 +240,7 @@ static JSValue js_filters_uniform_4f(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_uniform_mat4(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_uniform_mat4");
     (void)this_val;
     if (argc < 3) return JS_UNDEFINED;
 
@@ -290,6 +301,7 @@ static JSValue js_filters_uniform_mat4(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_draw_quad(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_draw_quad");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     filter_draw_quad();
     return JS_UNDEFINED;
@@ -299,6 +311,7 @@ static JSValue js_filters_draw_quad(JSContext *ctx, JSValueConst this_val,
 static JSValue js_filters_end(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+    RMMZ_PROF_SCOPE("filters.filters_end");
     (void)ctx; (void)this_val; (void)argc; (void)argv;
     filter_end();
     return JS_UNDEFINED;

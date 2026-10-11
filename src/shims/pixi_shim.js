@@ -368,6 +368,89 @@
 
     PIXI.Rectangle = Rectangle;
 
+    /* The other shapes of PIXI.SHAPES. Plugins subclass them (CGMZ_Circle extends PIXI.Circle) or build hit areas. */
+    PIXI.SHAPES = { POLY: 0, RECT: 1, CIRC: 2, ELIP: 3, RREC: 4 };
+
+    function Circle(x, y, radius) {
+        this.x = x || 0;
+        this.y = y || 0;
+        this.radius = radius || 0;
+        this.type = 2;
+    }
+    Circle.prototype.clone = function() { return new Circle(this.x, this.y, this.radius); };
+    Circle.prototype.contains = function(x, y) {
+        if (this.radius <= 0) return false;
+        var dx = this.x - x, dy = this.y - y;
+        return dx * dx + dy * dy <= this.radius * this.radius;
+    };
+    Circle.prototype.getBounds = function() {
+        return new Rectangle(this.x - this.radius, this.y - this.radius, this.radius * 2, this.radius * 2);
+    };
+    PIXI.Circle = Circle;
+
+    function Ellipse(x, y, halfWidth, halfHeight) {
+        this.x = x || 0;
+        this.y = y || 0;
+        this.width = halfWidth || 0;
+        this.height = halfHeight || 0;
+        this.type = 3;
+    }
+    Ellipse.prototype.clone = function() { return new Ellipse(this.x, this.y, this.width, this.height); };
+    Ellipse.prototype.contains = function(x, y) {
+        if (this.width <= 0 || this.height <= 0) return false;
+        var nx = (x - this.x) / this.width, ny = (y - this.y) / this.height;
+        return nx * nx + ny * ny <= 1;
+    };
+    Ellipse.prototype.getBounds = function() {
+        return new Rectangle(this.x - this.width, this.y - this.height, this.width * 2, this.height * 2);
+    };
+    PIXI.Ellipse = Ellipse;
+
+    function Polygon() {
+        var points = Array.prototype.slice.call(arguments);
+        if (Array.isArray(points[0])) points = points[0];
+        if (points.length && typeof points[0] === "object") {
+            var flat = [];
+            for (var i = 0; i < points.length; i++) flat.push(points[i].x, points[i].y);
+            points = flat;
+        }
+        this.points = points;
+        this.closeStroke = true;
+        this.type = 0;
+    }
+    Polygon.prototype.clone = function() {
+        var p = new Polygon(this.points.slice());
+        p.closeStroke = this.closeStroke;
+        return p;
+    };
+    Polygon.prototype.contains = function(x, y) {
+        var inside = false, n = this.points.length / 2;
+        for (var i = 0, j = n - 1; i < n; j = i++) {
+            var xi = this.points[i * 2], yi = this.points[i * 2 + 1];
+            var xj = this.points[j * 2], yj = this.points[j * 2 + 1];
+            if (((yi > y) !== (yj > y)) && (x < (xj - xi) * ((y - yi) / (yj - yi)) + xi)) inside = !inside;
+        }
+        return inside;
+    };
+    PIXI.Polygon = Polygon;
+
+    function RoundedRectangle(x, y, width, height, radius) {
+        this.x = x || 0;
+        this.y = y || 0;
+        this.width = width || 0;
+        this.height = height || 0;
+        this.radius = radius === undefined ? 20 : radius;
+        this.type = 4;
+    }
+    RoundedRectangle.prototype.clone = function() {
+        return new RoundedRectangle(this.x, this.y, this.width, this.height, this.radius);
+    };
+    RoundedRectangle.prototype.contains = function(x, y) {
+        if (this.width <= 0 || this.height <= 0) return false;
+        return x >= this.x && x <= this.x + this.width && y >= this.y && y <= this.y + this.height;
+    };
+    PIXI.RoundedRectangle = RoundedRectangle;
+
     /* PIXI.BaseTexture */
 
     var _baseTextureId = 0;
@@ -525,21 +608,38 @@
         var needCreate = this._glTexture === 0 || this._glTextureIsImageOwned ||
                          w !== this._glTexW || h !== this._glTexH;
         if (needCreate || this._glTextureDirtyId !== this.dirtyId) {
-            var pixels = __native_canvas2d.getPixels(ctx2d._handle);
-            if (!pixels) return;
+            var fastUpload = __native_renderer.updateTextureFromCanvas;
+            var pixels = fastUpload ? null : __native_canvas2d.getPixels(ctx2d._handle);
+            if (!fastUpload && !pixels) return;
             if (needCreate) {
                 if (this._glTexture && !this._glTextureIsImageOwned) {
-                    __native_renderer.deleteTexture(this._glTexture);
+                    __dropGlTexture(this);
                 }
                 this._glTexture = __native_renderer.createTexture(w, h);
+                /* frees the texture when this object is garbage collected */
+                this._glToken = __native_renderer.createTextureToken ? __native_renderer.createTextureToken(this._glTexture) : null;
                 this._glTextureIsImageOwned = false;
                 this._glTexW = w;
                 this._glTexH = h;
             }
-            __native_renderer.updateTexture(this._glTexture, w, h, pixels);
+            if (!fastUpload || !fastUpload(this._glTexture, w, h, ctx2d._handle)) {
+                if (!pixels) pixels = __native_canvas2d.getPixels(ctx2d._handle);
+                if (!pixels) return;
+                __native_renderer.updateTexture(this._glTexture, w, h, pixels);
+            }
             this._glTextureDirtyId = this.dirtyId;
         }
         _applyTextureScaleMode(this);
+    };
+
+    /* Deletes the GL texture of a canvas-backed BaseTexture now (and disarms its garbage-collection token). */
+    globalThis.__dropGlTexture = function(bt) {
+        if (bt._glToken && __native_renderer.releaseTextureToken) {
+            __native_renderer.releaseTextureToken(bt._glToken);
+        } else if (bt._glTexture) {
+            __native_renderer.deleteTexture(bt._glTexture);
+        }
+        bt._glToken = null;
     };
 
     BaseTexture.prototype.destroy = function() {
@@ -565,7 +665,7 @@
             if (this._glTextureIsImageOwned) {
                 this._glTexture = 0;
             } else {
-                __native_renderer.deleteTexture(this._glTexture);
+                __dropGlTexture(this);
                 this._glTexture = 0;
             }
         }
@@ -596,6 +696,7 @@
             cacheId = source;
             var cached = PIXI.utils.BaseTextureCache[cacheId];
             if (cached) return cached;
+            if (/\.(webm|mp4|ogv|m4v|mov)(\?|$)/i.test(source)) return BaseTexture.fromVideoUrl(source, options);
         }
 
         var bt = new BaseTexture(null, options);
@@ -604,6 +705,47 @@
             PIXI.utils.BaseTextureCache[cacheId] = bt;
             bt.textureCacheIds.push(cacheId);
         }
+        return bt;
+    };
+
+    /* A movie used as a texture (video plugins draw movies through PIXI sprites). The <video> element stands in for
+       the movie: it reports "loaded", can be "played" and ends, so scripts that wait for the end of a cutscene carry
+       on. The picture itself is not drawn (the texture stays empty). */
+    BaseTexture.fromVideoUrl = function(url, options) {
+        var video = document.createElement("video");
+        video.preload = "auto";
+        video.src = url;
+        var bt = new BaseTexture(null, options);
+        bt.cacheId = url;
+        PIXI.utils.BaseTextureCache[url] = bt;
+        bt.textureCacheIds.push(url);
+        bt.source = video;                        /* PIXI 4 */
+        bt.resource = { source: video, url: url, width: 0, height: 0 };   /* PIXI 5 */
+        /* With the native player the pictures are copied into a GL texture every frame and the full-screen overlay is
+           switched off (opacity 0); without it the texture stays empty and the movie just "ends". */
+        video.style.opacity = 0;
+        video._frameHook = function() {
+            if (!video._handle || typeof __native_video.updateTexture !== "function") return;
+            if (!bt._glTexture && video.videoWidth > 0 && typeof __native_renderer !== "undefined") {
+                bt._glTexture = __native_renderer.createTexture(video.videoWidth, video.videoHeight);
+                bt._glTextureIsImageOwned = false;
+                bt._glTexW = video.videoWidth;
+                bt._glTexH = video.videoHeight;
+                bt._glTextureDirtyId = bt.dirtyId;
+                bt._glToken = __native_renderer.createTextureToken ? __native_renderer.createTextureToken(bt._glTexture) : null;
+            }
+            if (bt._glTexture) __native_video.updateTexture(video._handle, bt._glTexture);
+        };
+        var ready = function() {
+            if (bt.valid) return;
+            bt.setRealSize(video.videoWidth || 2, video.videoHeight || 2);
+            bt.valid = true;
+            bt.emit("update", bt);
+            bt.emit("loaded", bt);
+        };
+        video.addEventListener("loadeddata", ready);
+        video.addEventListener("canplay", ready);
+        if (typeof video.load === "function") video.load();
         return bt;
     };
 
@@ -1499,20 +1641,32 @@
         set: function(v) { this.transform.position.y = v; }
     });
 
+    /* PIXI: assigning a point copies it (sprite.scale = otherPoint) */
     Object.defineProperty(DisplayObject.prototype, "position", {
-        get: function() { return this.transform.position; }
+        get: function() { return this.transform.position; },
+        set: function(v) { if (v && typeof v === "object") this.transform.position.copyFrom(v); },
+        configurable: true
     });
 
+    /* PIXI: assigning a point copies it (sprite.scale = otherPoint) */
     Object.defineProperty(DisplayObject.prototype, "scale", {
-        get: function() { return this.transform.scale; }
+        get: function() { return this.transform.scale; },
+        set: function(v) { if (v && typeof v === "object") this.transform.scale.copyFrom(v); },
+        configurable: true
     });
 
+    /* PIXI: assigning a point copies it (sprite.scale = otherPoint) */
     Object.defineProperty(DisplayObject.prototype, "pivot", {
-        get: function() { return this.transform.pivot; }
+        get: function() { return this.transform.pivot; },
+        set: function(v) { if (v && typeof v === "object") this.transform.pivot.copyFrom(v); },
+        configurable: true
     });
 
+    /* PIXI: assigning a point copies it (sprite.scale = otherPoint) */
     Object.defineProperty(DisplayObject.prototype, "skew", {
-        get: function() { return this.transform.skew; }
+        get: function() { return this.transform.skew; },
+        set: function(v) { if (v && typeof v === "object") this.transform.skew.copyFrom(v); },
+        configurable: true
     });
 
     Object.defineProperty(DisplayObject.prototype, "rotation", {
@@ -1923,7 +2077,7 @@
     function _filtersAreNoOp(filters) {
         for (var i = 0; i < filters.length; i++) {
             var f = filters[i];
-            if (f.enabled === false) continue;
+            if (f.enabled === false || f._rmBroken) continue;
             /* AlphaFilter needs no FBO pass; filterArea clipping uses GL scissor. */
             if (_isAlphaFilter(f)) continue;
             if (_isColorFilter(f)) {
@@ -2269,6 +2423,10 @@
         this.calculateVertices();
 
         if (typeof __native_renderer !== "undefined" && __native_renderer._active) {
+            /* RPG Maker MV marks a bitmap dirty when something is drawn on it and expects the renderer to call checkDirty()
+               (which updates the texture) when it draws the sprite; dialogue text appears letter by letter this way. */
+            var dirtyBitmap = this._bitmap;
+            if (dirtyBitmap && dirtyBitmap._dirty && typeof dirtyBitmap.checkDirty === "function") dirtyBitmap.checkDirty();
             var tex = this._texture;
             var bt = tex.baseTexture;
             var glTex = bt._glTexture || 0;
@@ -2414,6 +2572,10 @@
         if (!this._texture || !this._texture.valid) return;
 
         if (typeof __native_renderer !== "undefined" && __native_renderer._active) {
+            /* RPG Maker MV marks a bitmap dirty when something is drawn on it and expects the renderer to call checkDirty()
+               (which updates the texture) when it draws the sprite; dialogue text appears letter by letter this way. */
+            var dirtyBitmap = this._bitmap;
+            if (dirtyBitmap && dirtyBitmap._dirty && typeof dirtyBitmap.checkDirty === "function") dirtyBitmap.checkDirty();
             var tex = this._texture;
             var bt = tex.baseTexture;
             var glTex = bt._glTexture || 0;
@@ -4771,7 +4933,7 @@
         var currentTex = inputFBO.texture;
         var enabledFilters = [];
         for (var f = 0; f < this.filters.length; f++) {
-            if (this.filters[f].enabled !== false) {
+            if (this.filters[f].enabled !== false && !this.filters[f]._rmBroken) {
                 enabledFilters.push(this.filters[f]);
             }
         }
@@ -4784,7 +4946,22 @@
 
                 /* Tell multi-pass filters where to draw their final result. */
                 _filterOutputTarget = { fbo: outputFBO.fbo, w: screenW, h: screenH };
-                enabledFilters[fi].apply(renderer, currentTex, screenW, screenH);
+                try {
+                    enabledFilters[fi].apply(renderer, currentTex, screenW, screenH);
+                } catch (filterError) {
+                    /* A filter this renderer cannot run (for example a multi-pass pixi-filters effect) must not take the
+                       whole screen down: switch it off, log it once and pass the picture through unchanged. */
+                    var failed = enabledFilters[fi];
+                    failed._rmBroken = true; /* stays off even when a plugin sets enabled = true again */
+                    if (typeof console !== "undefined") {
+                        console.warn("filter switched off (" + ((failed.constructor && failed.constructor.name) || "?") + "): " +
+                                     (filterError && filterError.message ? filterError.message : filterError));
+                    }
+                    __native_renderer.bindRenderTexture(outputFBO.fbo, screenW, screenH);
+                    __native_renderer.beginFrameTransparent();
+                    __native_renderer.setBlendMode(4); /* premultiplied normal: a plain copy onto the cleared target */
+                    __native_renderer.drawQuad(currentTex, 0, 0, screenW, screenH, 0, 1, 1, 0, 0xFFFFFF, 1.0);
+                }
                 _filterOutputTarget = null;
 
                 __native_renderer.flush();

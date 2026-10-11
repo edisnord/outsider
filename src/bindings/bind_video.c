@@ -16,6 +16,17 @@ static bool handle_arg(JSContext *ctx, JSValueConst arg, VideoHandle *out)
     return true;
 }
 
+/* updateTexture(handle, texture) -> true when the texture received a new picture */
+static JSValue js_video_update_texture(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    VideoHandle h;
+    uint32_t tex = 0;
+    if (argc < 2 || !handle_arg(ctx, argv[0], &h) || JS_ToUint32(ctx, &tex, argv[1])) return JS_EXCEPTION;
+    return JS_NewBool(ctx, video_update_texture(h, tex));
+}
+
 /* open(path) -> handle (0 on failure) */
 static JSValue js_video_open(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
@@ -117,6 +128,7 @@ static const JSCFunctionListEntry js_video_funcs[] = {
     JS_CFUNC_DEF("open",       1, js_video_open),
     JS_CFUNC_DEF("close",      1, js_video_close),
     JS_CFUNC_DEF("play",       1, js_video_play),
+    JS_CFUNC_DEF("updateTexture", 2, js_video_update_texture),
     JS_CFUNC_DEF("pause",      1, js_video_pause),
     JS_CFUNC_DEF("setVolume",  2, js_video_set_volume),
     JS_CFUNC_DEF("setLoop",    2, js_video_set_loop),

@@ -29,7 +29,7 @@ typedef struct {
 
 #define STATE_STACK_MAX 64
 
-#define MAX_FONTS 64
+#define MAX_FONTS 512
 
 typedef struct {
     char            *name;
@@ -80,20 +80,21 @@ typedef struct {
     bool           active;
 } Canvas2DCtx;
 
-#define MAX_CONTEXTS 256
+/* A handle is (generation << 12 | slot): looking a canvas up is one array access, and a stale handle of a canvas
+   that was freed never reaches a newer canvas that took its slot. */
+#define CONTEXT_SLOT_BITS 12
+#define MAX_CONTEXTS (1u << CONTEXT_SLOT_BITS)
 
 static Canvas2DCtx    s_contexts[MAX_CONTEXTS];
-static Canvas2DHandle s_next_handle = 1;
+static Canvas2DHandle s_next_generation = 1;
+static size_t         s_next_slot   = 0;    /* where the search for a free slot starts */
+static size_t         s_bytes_alive = 0;    /* pixel memory of all canvases */
 static size_t         s_ctx_count   = 0;
 
 static Canvas2DCtx *find_ctx(Canvas2DHandle h)
 {
-    for (size_t i = 0; i < MAX_CONTEXTS; i++) {
-        if (s_contexts[i].active && s_contexts[i].handle == h) {
-            return &s_contexts[i];
-        }
-    }
-    return NULL;
+    Canvas2DCtx *ctx = &s_contexts[h & (MAX_CONTEXTS - 1)];
+    return (ctx->active && ctx->handle == h) ? ctx : NULL;
 }
 
 static FontEntry *find_font(const char *name)
@@ -114,6 +115,101 @@ static inline int clampi(int v, int lo, int hi)
     return v;
 }
 
+/* Operators whose result is "nothing" wherever the source is empty (spec: they clear the destination there, also
+   outside the drawn shape): copy, source-in, source-out, destination-in, destination-atop. */
+static inline int comp_clears_dst(int comp_op)
+{
+    return comp_op == CANVAS2D_COMP_COPY || comp_op == CANVAS2D_COMP_SOURCE_IN || comp_op == CANVAS2D_COMP_SOURCE_OUT ||
+           comp_op == CANVAS2D_COMP_DEST_IN || comp_op == CANVAS2D_COMP_DEST_ATOP;
+}
+
+/* Porter-Duff operators that depend on both alphas (straight-alpha pixels): result = source * Fa + dest * Fb. */
+static void blend_porter_duff(uint8_t *dst, uint8_t sr, uint8_t sg, uint8_t sb, int sa, int comp_op)
+{
+    int da = dst[3];
+    int fa, fb; /* 0..255 */
+    switch (comp_op) {
+    case CANVAS2D_COMP_SOURCE_ATOP: fa = da;       fb = 255 - sa; break;
+    case CANVAS2D_COMP_SOURCE_IN:   fa = da;       fb = 0;        break;
+    case CANVAS2D_COMP_SOURCE_OUT:  fa = 255 - da; fb = 0;        break;
+    case CANVAS2D_COMP_DEST_OVER:   fa = 255 - da; fb = 255;      break;
+    case CANVAS2D_COMP_DEST_IN:     fa = 0;        fb = sa;       break;
+    case CANVAS2D_COMP_DEST_OUT:    fa = 0;        fb = 255 - sa; break;
+    case CANVAS2D_COMP_DEST_ATOP:   fa = 255 - da; fb = sa;       break;
+    default:                        fa = 255 - da; fb = 255 - sa; break; /* xor */
+    }
+    int ws = sa * fa, wd = da * fb, tot = ws + wd;
+    int out_a = (tot + 127) / 255;
+    if (out_a <= 0) {
+        dst[0] = dst[1] = dst[2] = dst[3] = 0;
+        return;
+    }
+    dst[0] = (uint8_t)((sr * ws + dst[0] * wd + tot / 2) / tot);
+    dst[1] = (uint8_t)((sg * ws + dst[1] * wd + tot / 2) / tot);
+    dst[2] = (uint8_t)((sb * ws + dst[2] * wd + tot / 2) / tot);
+    dst[3] = (uint8_t)(out_a > 255 ? 255 : out_a);
+}
+
+static inline float blend_lum(const float *c) { return 0.3f * c[0] + 0.59f * c[1] + 0.11f * c[2]; }
+
+/* "difference" and "saturation" blend modes (W3C compositing: the blended colour replaces the source colour in
+   proportion to the backdrop alpha, then the usual source-over). */
+static void blend_special(uint8_t *dst, uint8_t sr, uint8_t sg, uint8_t sb, int sa, int comp_op)
+{
+    float as = sa / 255.0f, ab = dst[3] / 255.0f;
+    float cb[3] = { dst[0] / 255.0f, dst[1] / 255.0f, dst[2] / 255.0f };
+    float cs[3] = { sr / 255.0f, sg / 255.0f, sb / 255.0f };
+    float bl[3];
+    if (comp_op == CANVAS2D_COMP_DIFFERENCE) {
+        for (int i = 0; i < 3; i++) bl[i] = fabsf(cb[i] - cs[i]);
+    } else { /* saturation: backdrop hue and luminosity, source saturation */
+        float smax = fmaxf(cs[0], fmaxf(cs[1], cs[2])), smin = fminf(cs[0], fminf(cs[1], cs[2]));
+        float sat = smax - smin;
+        float bmax = fmaxf(cb[0], fmaxf(cb[1], cb[2])), bmin = fminf(cb[0], fminf(cb[1], cb[2]));
+        float t[3] = { 0.0f, 0.0f, 0.0f };
+        if (bmax > bmin)
+            for (int i = 0; i < 3; i++) t[i] = (cb[i] - bmin) * sat / (bmax - bmin);
+        float d = blend_lum(cb) - blend_lum(t);
+        for (int i = 0; i < 3; i++) bl[i] = t[i] + d;
+        float l = blend_lum(bl), n = fminf(bl[0], fminf(bl[1], bl[2])), x = fmaxf(bl[0], fmaxf(bl[1], bl[2]));
+        if (n < 0.0f)
+            for (int i = 0; i < 3; i++) bl[i] = l + (bl[i] - l) * l / (l - n);
+        if (x > 1.0f)
+            for (int i = 0; i < 3; i++) bl[i] = l + (bl[i] - l) * (1.0f - l) / (x - l);
+    }
+    float ao = as + ab - as * ab;
+    if (ao <= 0.0f) {
+        dst[0] = dst[1] = dst[2] = dst[3] = 0;
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        float csp = (1.0f - ab) * cs[i] + ab * bl[i];
+        float co = (as * csp + (1.0f - as) * ab * cb[i]) / ao;
+        int v = (int)(co * 255.0f + 0.5f);
+        dst[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+    dst[3] = (uint8_t)(int)(ao * 255.0f + 0.5f);
+}
+
+/* Clears everything outside the rectangle [x0,x1) x [y0,y1) (already clamped to the canvas). */
+static void clear_outside(Canvas2DCtx *ctx, int x0, int y0, int x1, int y1)
+{
+    int W = ctx->width, H = ctx->height;
+    if (x1 <= x0 || y1 <= y0) {
+        memset(ctx->pixels, 0, (size_t)W * H * 4);
+        return;
+    }
+    for (int y = 0; y < H; y++) {
+        uint8_t *row = ctx->pixels + (size_t)y * W * 4;
+        if (y < y0 || y >= y1) {
+            memset(row, 0, (size_t)W * 4);
+        } else {
+            if (x0 > 0) memset(row, 0, (size_t)x0 * 4);
+            if (x1 < W) memset(row + (size_t)x1 * 4, 0, (size_t)(W - x1) * 4);
+        }
+    }
+}
+
 /* Composite a source RGBA pixel onto a destination pixel with the given
    composite operation and global alpha. */
 static inline void blend_pixel(uint8_t *dst,
@@ -121,7 +217,10 @@ static inline void blend_pixel(uint8_t *dst,
                                 float global_alpha, int comp_op)
 {
     int src_a = (int)(sa * global_alpha + 0.5f);
-    if (src_a <= 0) return;
+    if (src_a <= 0) {
+        if (comp_clears_dst(comp_op)) dst[0] = dst[1] = dst[2] = dst[3] = 0;
+        return;
+    }
 
     if (comp_op == CANVAS2D_COMP_COPY) {
         dst[0] = sr;
@@ -198,7 +297,21 @@ static inline void blend_pixel(uint8_t *dst,
         return;
     }
 
-    /* Unimplemented modes fall back to source-over. */
+    if (comp_op == CANVAS2D_COMP_DIFFERENCE || comp_op == CANVAS2D_COMP_SATURATION) {
+        blend_special(dst, sr, sg, sb, src_a, comp_op);
+        return;
+    }
+
+    if (comp_op >= CANVAS2D_COMP_SOURCE_ATOP && comp_op <= CANVAS2D_COMP_DEST_OUT) {
+        blend_porter_duff(dst, sr, sg, sb, src_a, comp_op);
+        return;
+    }
+    if (comp_op == CANVAS2D_COMP_XOR) {
+        blend_porter_duff(dst, sr, sg, sb, src_a, comp_op);
+        return;
+    }
+
+    /* Anything else falls back to source-over. */
     {
         int inv = 255 - src_a;
         int out_a = src_a + ((dst_a * inv + 127) / 255);
@@ -245,7 +358,9 @@ static void free_state(DrawState *s)
 void canvas2d_init(void)
 {
     memset(s_contexts, 0, sizeof(s_contexts));
-    s_next_handle = 1;
+    s_next_generation = 1;
+    s_next_slot = 0;
+    s_bytes_alive = 0;
     s_ctx_count = 0;
 }
 
@@ -288,7 +403,8 @@ Canvas2DHandle canvas2d_create(int width, int height)
     uint64_t alloc_check = (uint64_t)width * (uint64_t)height * 4;
     if (alloc_check > SIZE_MAX) return CANVAS2D_HANDLE_INVALID;
 
-    for (size_t i = 0; i < MAX_CONTEXTS; i++) {
+    for (size_t n = 0; n < MAX_CONTEXTS; n++) {
+        size_t i = (s_next_slot + n) & (MAX_CONTEXTS - 1);
         if (!s_contexts[i].active) {
             Canvas2DCtx *ctx = &s_contexts[i];
             size_t buf_size = (size_t)alloc_check;
@@ -297,13 +413,19 @@ Canvas2DHandle canvas2d_create(int width, int height)
 
             ctx->width = width;
             ctx->height = height;
-            ctx->handle = s_next_handle++;
-            if (s_next_handle == 0) s_next_handle = 1; /* skip INVALID */
+            Canvas2DHandle gen = s_next_generation++;
+            if ((gen << CONTEXT_SLOT_BITS) >> CONTEXT_SLOT_BITS != gen || gen == 0) {   /* wrapped around: start again */
+                s_next_generation = 2;
+                gen = 1;
+            }
+            ctx->handle = (gen << CONTEXT_SLOT_BITS) | (Canvas2DHandle)i;
             ctx->active = true;
             ctx->state_depth = 0;
             init_state(&ctx->state);
 
+            s_next_slot = i + 1;
             s_ctx_count++;
+            s_bytes_alive += buf_size;
             return ctx->handle;
         }
     }
@@ -315,6 +437,7 @@ void canvas2d_destroy(Canvas2DHandle handle)
     Canvas2DCtx *ctx = find_ctx(handle);
     if (!ctx) return;
 
+    s_bytes_alive -= (size_t)ctx->width * (size_t)ctx->height * 4;
     free(ctx->pixels);
     free_state(&ctx->state);
     for (int j = 0; j < ctx->state_depth; j++) {
@@ -338,6 +461,7 @@ void canvas2d_resize(Canvas2DHandle handle, int width, int height)
     uint8_t *new_pixels = calloc(1, buf_size);
     if (!new_pixels) return;
 
+    s_bytes_alive = s_bytes_alive - (size_t)ctx->width * (size_t)ctx->height * 4 + buf_size;
     free(ctx->pixels);
     ctx->pixels = new_pixels;
     ctx->width = width;
@@ -362,6 +486,20 @@ uint8_t *canvas2d_get_pixels(Canvas2DHandle handle)
 size_t canvas2d_context_count(void)
 {
     return s_ctx_count;
+}
+
+size_t canvas2d_list_sizes(int *w, int *h, size_t max)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < MAX_CONTEXTS && n < max; i++) {
+        if (s_contexts[i].active) { w[n] = s_contexts[i].width; h[n] = s_contexts[i].height; n++; }
+    }
+    return n;
+}
+
+size_t canvas2d_bytes_alive(void)
+{
+    return s_bytes_alive;
 }
 
 /* State setters */
@@ -444,6 +582,101 @@ void canvas2d_restore(Canvas2DHandle h)
 
 /* Drawing operations */
 
+#define FILL_DIV255(x) ((uint32_t)(((uint64_t)(x) * 0x80808081ULL) >> 39))
+typedef uint32_t __attribute__((may_alias)) pixel32_t;
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#include <cpuid.h>
+#define CANVAS2D_HAVE_X86_SIMD 1
+
+/* AVX2 is used for the hot loops (lights) when the CPU and the OS support it; both the console and any PC from
+   the last decade do. RMMZ_NO_AVX2=1 turns it off (to compare). */
+static int have_avx2(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int ok = 0;
+    unsigned a, b, c, d;
+    if (__get_cpuid(1, &a, &b, &c, &d) && (c & (1u << 27)) && (c & (1u << 28))) {   /* OSXSAVE, AVX */
+        unsigned xlo, xhi;
+        __asm__ volatile("xgetbv" : "=a"(xlo), "=d"(xhi) : "c"(0));
+        if ((xlo & 6) == 6 && __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & (1u << 5))) ok = 1;
+    }
+    if (getenv("RMMZ_NO_AVX2")) ok = 0;
+    cached = ok;
+    return ok;
+}
+
+/* Additive fill of an opaque destination: result = min(255, dst + (colour*alpha + 127) / 255) per channel, which is
+   exactly what the general formula gives when the destination alpha is 255, and one saturating byte add. Returns
+   the number of pixels done (a multiple of 8, stopping at the first block that is not fully opaque); the caller's
+   general loop continues where this stops. */
+__attribute__((target("avx2")))
+static int fill_lighter_avx2(uint8_t *dst, int n, uint32_t r8, uint32_t g8, uint32_t b8)
+{
+    const __m256i add = _mm256_set1_epi32((int)(r8 | (g8 << 8) | (b8 << 16) | (255u << 24)));
+    const __m256i full = _mm256_set1_epi32(255);
+    int i = 0;
+    for (; i + 8 <= n; i += 8, dst += 32) {
+        __m256i d = _mm256_loadu_si256((const __m256i *)dst);
+        int opaque = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_srli_epi32(d, 24), full)));
+        if (opaque != 0xff) break;
+        _mm256_storeu_si256((__m256i *)dst, _mm256_adds_epu8(d, add));
+    }
+    return i;
+}
+#endif
+
+/* Blends one colour into n pixels exactly like blend_pixel() does, with everything that only depends on the
+   colour and the drawing state worked out once instead of per pixel. blend_pixel() is a long chain of
+   branches; on the console's compiler it costs about 20 cycles a pixel even for an opaque fill, and the
+   lighting plugin clears whole-screen canvases with it every frame. */
+static void fill_span(uint8_t *dst, int n, uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa, float ga, int comp)
+{
+    if (n <= 0) return;
+    int src_a = (int)(sa * ga + 0.5f);
+    if (src_a <= 0) {
+        if (comp_clears_dst(comp)) memset(dst, 0, (size_t)n * 4);
+        return;
+    }
+
+    if (comp == CANVAS2D_COMP_COPY || (comp == CANVAS2D_COMP_SOURCE_OVER && src_a >= 255)) {
+        uint32_t a = comp == CANVAS2D_COMP_COPY ? (uint32_t)src_a : 255u;
+        uint32_t v = (uint32_t)sr | ((uint32_t)sg << 8) | ((uint32_t)sb << 16) | (a << 24);
+        pixel32_t *px = (pixel32_t *)dst;
+        for (int i = 0; i < n; i++) px[i] = v;
+        return;
+    }
+
+    if (comp == CANVAS2D_COMP_LIGHTER) {
+        uint32_t pr = (uint32_t)sr * (uint32_t)src_a, pg = (uint32_t)sg * (uint32_t)src_a;
+        uint32_t pb = (uint32_t)sb * (uint32_t)src_a, sa32 = (uint32_t)src_a;
+#ifdef CANVAS2D_HAVE_X86_SIMD
+        if (n >= 8 && have_avx2()) {
+            int done = fill_lighter_avx2(dst, n, FILL_DIV255(pr + 127), FILL_DIV255(pg + 127), FILL_DIV255(pb + 127));
+            dst += (size_t)done * 4;
+            n -= done;
+        }
+#endif
+        for (int i = 0; i < n; i++, dst += 4) {
+            uint32_t da = dst[3];
+            uint32_t v = FILL_DIV255(pr + dst[0] * da + 127);
+            dst[0] = (uint8_t)(v > 255 ? 255 : v);
+            v = FILL_DIV255(pg + dst[1] * da + 127);
+            dst[1] = (uint8_t)(v > 255 ? 255 : v);
+            v = FILL_DIV255(pb + dst[2] * da + 127);
+            dst[2] = (uint8_t)(v > 255 ? 255 : v);
+            v = sa32 + da;
+            dst[3] = (uint8_t)(v > 255 ? 255 : v);
+        }
+        return;
+    }
+
+    for (int i = 0; i < n; i++, dst += 4)
+        blend_pixel(dst, sr, sg, sb, sa, ga, comp);
+}
+
 void canvas2d_fill_rect(Canvas2DHandle h, int x, int y, int w, int h2)
 {
     Canvas2DCtx *ctx = find_ctx(h);
@@ -461,12 +694,580 @@ void canvas2d_fill_rect(Canvas2DHandle h, int x, int y, int w, int h2)
     float ga = ctx->state.global_alpha;
     int comp = ctx->state.composite_op;
 
-    for (int py = y0; py < y1; py++) {
-        for (int px = x0; px < x1; px++) {
-            uint8_t *dst = ctx->pixels + ((size_t)py * ctx->width + px) * 4;
-            blend_pixel(dst, fr, fg, fb, fa, ga, comp);
+    for (int py = y0; py < y1; py++)
+        fill_span(ctx->pixels + ((size_t)py * ctx->width + x0) * 4, x1 - x0, fr, fg, fb, fa, ga, comp);
+    if (comp_clears_dst(comp)) clear_outside(ctx, x0, y0, x1, y1);
+}
+
+#define GRADIENT_LUT_SIZE 1024
+
+/* ---- helper threads for big fills ------------------------------------------------------------------
+   Lighting plugins fill hundreds of thousands of pixels with gradients many times per frame. Rows are
+   independent, so large fills are split between the calling thread and a few helper threads. */
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <unistd.h>
+
+typedef void (*ParRowsFn)(void *arg, int y0, int y1);
+
+#define PAR_MAX_WORKERS 6
+
+static int par_worker_count = -1;   /* -1: not started yet */
+static pthread_mutex_t par_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t par_wake = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t par_idle = PTHREAD_COND_INITIALIZER;
+static struct {
+    ParRowsFn fn;
+    void     *arg;
+    int       y1;
+    int       chunk;
+    int       open;         /* workers may still join this job */
+    int       active;       /* workers currently inside it */
+    unsigned  generation;
+    atomic_int next;
+} par_job;
+
+static void par_run_chunks(ParRowsFn fn, void *arg, int y1, int chunk)
+{
+    for (;;) {
+        int y = atomic_fetch_add(&par_job.next, chunk);
+        if (y >= y1) break;
+        int e = y + chunk;
+        if (e > y1) e = y1;
+        fn(arg, y, e);
+    }
+}
+
+static void *par_worker(void *unused)
+{
+    (void)unused;
+    unsigned seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&par_mutex);
+        while (par_job.generation == seen || !par_job.open)
+            pthread_cond_wait(&par_wake, &par_mutex);
+        seen = par_job.generation;
+        ParRowsFn fn = par_job.fn;
+        void *arg = par_job.arg;
+        int y1 = par_job.y1, chunk = par_job.chunk;
+        par_job.active++;
+        pthread_mutex_unlock(&par_mutex);
+
+        par_run_chunks(fn, arg, y1, chunk);
+
+        pthread_mutex_lock(&par_mutex);
+        if (--par_job.active == 0) pthread_cond_signal(&par_idle);
+        pthread_mutex_unlock(&par_mutex);
+    }
+    return NULL;
+}
+
+static void par_init(void)
+{
+    par_worker_count = 0;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    int want = n >= 4 ? (int)(n - 1 > 4 ? 4 : n - 1) : 0;
+    const char *env = getenv("RMMZ_CANVAS_THREADS");
+    if (env && *env) want = atoi(env);
+    if (want > PAR_MAX_WORKERS) want = PAR_MAX_WORKERS;
+    for (int i = 0; i < want; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, par_worker, NULL) != 0) break;
+        pthread_detach(t);
+        par_worker_count++;
+    }
+    /* Without this line a console that reports few CPUs silently runs every fill on one thread (about four times
+       slower in a lighting-heavy map), which looks like a slow rasteriser rather than a missing thread pool. */
+    printf("canvas2d: %ld online CPUs, %d of %d fill worker threads started%s\n", n, par_worker_count, want,
+           env && *env ? " (RMMZ_CANVAS_THREADS)" : "");
+    fflush(stdout);
+}
+
+/* Runs fn over rows [y0, y1). work_px is a rough size of the whole job; small jobs stay on this thread. */
+static void par_rows(ParRowsFn fn, void *arg, int y0, int y1, long work_px)
+{
+    if (par_worker_count < 0) par_init();
+    if (par_worker_count == 0 || work_px < 60000 || y1 - y0 < 8) {
+        fn(arg, y0, y1);
+        return;
+    }
+    int chunk = (y1 - y0) / ((par_worker_count + 1) * 4);
+    if (chunk < 2) chunk = 2;
+
+    pthread_mutex_lock(&par_mutex);
+    par_job.fn = fn;
+    par_job.arg = arg;
+    par_job.y1 = y1;
+    par_job.chunk = chunk;
+    atomic_store(&par_job.next, y0);
+    par_job.open = 1;
+    par_job.generation++;
+    pthread_cond_broadcast(&par_wake);
+    pthread_mutex_unlock(&par_mutex);
+
+    par_run_chunks(fn, arg, y1, chunk);
+
+    pthread_mutex_lock(&par_mutex);
+    par_job.open = 0;
+    while (par_job.active > 0)
+        pthread_cond_wait(&par_idle, &par_mutex);
+    pthread_mutex_unlock(&par_mutex);
+}
+
+/* ---- gradients ---------------------------------------------------------------------------------- */
+
+/* Colour of a gradient at t (0..1), the same interpolation the JS shim used. */
+static void gradient_color(const double *offsets, const uint8_t *rgba, int n, double t, uint8_t out[4])
+{
+    if (t <= offsets[0]) { memcpy(out, rgba, 4); return; }
+    if (t >= offsets[n - 1]) { memcpy(out, rgba + 4 * (n - 1), 4); return; }
+    for (int i = 0; i < n - 1; i++) {
+        if (t >= offsets[i] && t <= offsets[i + 1]) {
+            double range = offsets[i + 1] - offsets[i];
+            double lt = range > 0 ? (t - offsets[i]) / range : 0;
+            const uint8_t *c0 = rgba + 4 * i, *c1 = rgba + 4 * (i + 1);
+            for (int k = 0; k < 4; k++)
+                out[k] = (uint8_t)clampi((int)(c0[k] + (c1[k] - c0[k]) * lt + 0.5), 0, 255);
+            return;
         }
     }
+    memcpy(out, rgba + 4 * (n - 1), 4);
+}
+
+#define DIV255(x) ((uint32_t)(((uint64_t)(x) * 0x80808081ULL) >> 39))
+
+/* One entry of the square-distance table used by the fast additive radial path. */
+typedef struct { uint32_t a, pr, pg, pb; } FastEntry;
+
+typedef struct {
+    bool       radial;
+    double     p[4];        /* linear: x0,y0,x1,y1; radial: cx,cy,r0,r1 */
+    double     len_sq;      /* linear only */
+    bool       outside_clear;   /* radial: nothing is drawn beyond the outer radius (last stop transparent) */
+    uint8_t    first[4];    /* colour of the first stop (degenerate linear gradients) */
+    /* fast additive radial path: colours indexed by squared distance, no square root per pixel */
+    FastEntry *fast;
+    uint32_t  *fast_packed;   /* the same as bytes for opaque destinations: min(255, (colour*alpha + 127) / 255), alpha 255 */
+    int        fast_bins;
+    float      fast_inv;
+    uint8_t    lut[GRADIENT_LUT_SIZE][4];
+} GradientPaint;
+
+static bool gradient_is_uniform(const GradientPaint *g)
+{
+    for (int i = 1; i < GRADIENT_LUT_SIZE; i++)
+        if (memcmp(g->lut[i], g->lut[0], 4) != 0) return false;
+    return true;
+}
+
+static void gradient_init(GradientPaint *g, bool radial, double p0, double p1, double p2, double p3,
+                          const double *offsets, const uint8_t *rgba, int n)
+{
+    g->radial = radial;
+    g->p[0] = p0; g->p[1] = p1; g->p[2] = p2; g->p[3] = p3;
+    g->len_sq = (p2 - p0) * (p2 - p0) + (p3 - p1) * (p3 - p1);
+    memcpy(g->first, rgba, 4);
+    for (int i = 0; i < GRADIENT_LUT_SIZE; i++)
+        gradient_color(offsets, rgba, n, (double)i / (GRADIENT_LUT_SIZE - 1), g->lut[i]);
+    g->outside_clear = false;
+    g->fast = NULL;
+    g->fast_packed = NULL;
+    g->fast_bins = 0;
+    g->fast_inv = 0;
+}
+
+static void gradient_free(GradientPaint *g)
+{
+    if (!g) return;
+    free(g->fast);
+    free(g->fast_packed);
+    free(g);
+}
+
+/* Called once the drawing state is known: notes whether the far side of a radial gradient is invisible and
+   prepares the fast path for additive ("lighter") radial gradients, which is what lights are. */
+static void gradient_finish(const Canvas2DCtx *ctx, GradientPaint *g)
+{
+    if (!g->radial) return;
+    float ga = ctx->state.global_alpha;
+    int outer_a = (int)(g->lut[GRADIENT_LUT_SIZE - 1][3] * ga + 0.5f);
+    g->outside_clear = outer_a <= 0;
+
+    double r0 = g->p[2], r1 = g->p[3], denom = r1 - r0;
+    if (g->outside_clear && denom > 0 && r1 >= 1 && ctx->state.composite_op == CANVAS2D_COMP_LIGHTER) {
+        int bins = (int)(r1 * 2.5);
+        if (bins < 64) bins = 64;
+        if (bins > 1024) bins = 1024;
+        FastEntry *fast = malloc((size_t)bins * sizeof(FastEntry));
+        if (!fast) return;
+        double inv = bins / (r1 * r1);
+        for (int i = 0; i < bins; i++) {
+            double d = sqrt((i + 0.5) / inv);
+            double t = (d - r0) / denom;
+            if (t < 0) t = 0; else if (t > 1) t = 1;
+            const uint8_t *c = g->lut[(int)(t * (GRADIENT_LUT_SIZE - 1) + 0.5)];
+            uint32_t a = (uint32_t)(c[3] * ga + 0.5f);
+            fast[i].a = a;
+            fast[i].pr = c[0] * a;
+            fast[i].pg = c[1] * a;
+            fast[i].pb = c[2] * a;
+        }
+        uint32_t *packed = malloc((size_t)bins * sizeof(uint32_t));
+        if (packed) {
+            for (int i = 0; i < bins; i++) {
+                if (fast[i].a == 0) { packed[i] = 0; continue; }
+                packed[i] = DIV255(fast[i].pr + 127) | (DIV255(fast[i].pg + 127) << 8) |
+                            (DIV255(fast[i].pb + 127) << 16) | (255u << 24);
+            }
+        }
+        g->fast = fast;
+        g->fast_packed = packed;
+        g->fast_bins = bins;
+        g->fast_inv = (float)inv;
+    }
+}
+
+#ifdef CANVAS2D_HAVE_X86_SIMD
+/* Eight pixels at a time for the additive radial gradient: the table index of each pixel is worked out in a
+   vector, and where all eight destination pixels are opaque (the lighting plugin's canvases always are) the
+   result is a saturating byte add of the table's bytes (see fill_lighter_avx2). Returns how many pixels were done
+   (a multiple of 8, stopping at the first block with a not fully opaque destination); the scalar loop continues. */
+__attribute__((target("avx2")))
+static int gradient_blocks_avx2(uint8_t *dst, int px0, int x1, float fcx, float dy2, float inv, int last,
+                                const uint32_t *packed)
+{
+    const __m256 vinv = _mm256_set1_ps(inv), vdy2 = _mm256_set1_ps(dy2);
+    const __m256i vlast = _mm256_set1_epi32(last), full = _mm256_set1_epi32(255);
+    __m256 vx = _mm256_sub_ps(_mm256_add_ps(_mm256_add_ps(_mm256_set1_ps((float)px0), _mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7)),
+                                            _mm256_set1_ps(0.5f)), _mm256_set1_ps(fcx));
+    const __m256 v8 = _mm256_set1_ps(8.0f);
+    int px = px0;
+    for (; px + 8 <= x1; px += 8, dst += 32) {
+        __m256i d = _mm256_loadu_si256((const __m256i *)dst);
+        if (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_srli_epi32(d, 24), full))) != 0xff) break;
+        __m256 d2 = _mm256_add_ps(_mm256_mul_ps(vx, vx), vdy2);
+        __m256i idx = _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_mul_ps(d2, vinv)), vlast);
+#ifdef __SCE__
+        /* Zen 2 gathers are slow: eight plain loads are quicker on the console */
+        uint32_t i[8] __attribute__((aligned(32)));
+        _mm256_store_si256((__m256i *)i, idx);
+        __m256i add = _mm256_setr_epi32((int)packed[i[0]], (int)packed[i[1]], (int)packed[i[2]], (int)packed[i[3]],
+                                        (int)packed[i[4]], (int)packed[i[5]], (int)packed[i[6]], (int)packed[i[7]]);
+#else
+        __m256i add = _mm256_i32gather_epi32((const int *)packed, idx, 4);
+#endif
+        _mm256_storeu_si256((__m256i *)dst, _mm256_adds_epu8(d, add));
+        vx = _mm256_add_ps(vx, v8);
+    }
+    return px - px0;
+}
+#endif
+
+/* Additive radial gradient: same result as blend_pixel(..., CANVAS2D_COMP_LIGHTER), minus the divisions by a
+   variable and the square root. Only the chord of the circle on this row is visited. */
+static void gradient_span_fast(Canvas2DCtx *ctx, const GradientPaint *g, int y, int x0, int x1)
+{
+    double cx = g->p[0], cy = g->p[1], r1 = g->p[3];
+    double ddy = (y + 0.5) - cy;
+    double rem = r1 * r1 - ddy * ddy;
+    if (rem < 0) return;
+    double half = sqrt(rem);
+    int cxa = (int)ceil(cx - half - 0.5), cxb = (int)floor(cx + half - 0.5) + 1;
+    if (cxa > x0) x0 = cxa;
+    if (cxb < x1) x1 = cxb;
+    if (x0 >= x1) return;
+
+    float fcx = (float)cx, dy2 = (float)(ddy * ddy), inv = g->fast_inv;
+    int last = g->fast_bins - 1;
+    const FastEntry *fast = g->fast;
+    uint8_t *dst = ctx->pixels + ((size_t)y * ctx->width + x0) * 4;
+    int px = x0;
+#ifdef CANVAS2D_HAVE_X86_SIMD
+    if (g->fast_packed && x1 - x0 >= 8 && have_avx2()) {
+        int done = gradient_blocks_avx2(dst, x0, x1, fcx, dy2, inv, last, g->fast_packed);
+        px += done;
+        dst += (size_t)done * 4;
+    }
+#endif
+    for (; px < x1; px++, dst += 4) {
+        float dx = (px + 0.5f) - fcx;
+        int idx = (int)((dx * dx + dy2) * inv);
+        if (idx > last) idx = last;
+        const FastEntry *e = &fast[idx];
+        uint32_t a = e->a;
+        if (a == 0) continue;
+        uint32_t da = dst[3];
+        uint32_t v = DIV255(e->pr + dst[0] * da + 127);
+        dst[0] = (uint8_t)(v > 255 ? 255 : v);
+        v = DIV255(e->pg + dst[1] * da + 127);
+        dst[1] = (uint8_t)(v > 255 ? 255 : v);
+        v = DIV255(e->pb + dst[2] * da + 127);
+        dst[2] = (uint8_t)(v > 255 ? 255 : v);
+        v = a + da;
+        dst[3] = (uint8_t)(v > 255 ? 255 : v);
+    }
+}
+
+/* Blend the gradient into pixels [x0, x1) of row y (already clipped to the canvas). */
+static void gradient_span(Canvas2DCtx *ctx, const GradientPaint *g, int y, int x0, int x1)
+{
+    if (g->fast) {
+        gradient_span_fast(ctx, g, y, x0, x1);
+        return;
+    }
+    float ga = ctx->state.global_alpha;
+    int comp = ctx->state.composite_op;
+    uint8_t *dst = ctx->pixels + ((size_t)y * ctx->width + x0) * 4;
+
+    if (g->radial) {
+        double cx = g->p[0], cy = g->p[1], r0 = g->p[2], denom = g->p[3] - g->p[2];
+        double ddy = (y + 0.5) - cy;
+        if (g->outside_clear && denom > 0) {
+            /* Beyond the outer radius the colour is transparent, and drawing transparent pixels changes
+               nothing: only the chord of the circle on this row needs work. */
+            double r1 = g->p[3];
+            double rem = r1 * r1 - ddy * ddy;
+            if (rem < 0) return;
+            double half = sqrt(rem);
+            int cxa = (int)ceil(cx - half - 0.5), cxb = (int)floor(cx + half - 0.5) + 1;
+            if (cxa > x0) { dst += (size_t)(cxa - x0) * 4; x0 = cxa; }
+            if (cxb < x1) x1 = cxb;
+            if (x0 >= x1) return;
+        }
+        for (int px = x0; px < x1; px++, dst += 4) {
+            double ddx = (px + 0.5) - cx;
+            double dist = sqrt(ddx * ddx + ddy * ddy);
+            double rt = denom != 0 ? (dist - r0) / denom : (dist <= r0 ? 0 : 1);
+            if (rt < 0) rt = 0; else if (rt > 1) rt = 1;
+            const uint8_t *c = g->lut[(int)(rt * (GRADIENT_LUT_SIZE - 1) + 0.5)];
+            blend_pixel(dst, c[0], c[1], c[2], c[3], ga, comp);
+        }
+        return;
+    }
+
+    if (g->len_sq == 0) {
+        for (int px = x0; px < x1; px++, dst += 4)
+            blend_pixel(dst, g->first[0], g->first[1], g->first[2], g->first[3], ga, comp);
+        return;
+    }
+    double dx = g->p[2] - g->p[0], dy = g->p[3] - g->p[1];
+    double row_t = (((y + 0.5) - g->p[1]) * dy - g->p[0] * dx) / g->len_sq;
+    double step = dx / g->len_sq;
+    for (int px = x0; px < x1; px++, dst += 4) {
+        double t = row_t + (px + 0.5) * step;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        const uint8_t *c = g->lut[(int)(t * (GRADIENT_LUT_SIZE - 1) + 0.5)];
+        blend_pixel(dst, c[0], c[1], c[2], c[3], ga, comp);
+    }
+}
+
+typedef struct {
+    Canvas2DCtx        *ctx;
+    const GradientPaint *g;
+    int                 x0, x1;
+} GradRectJob;
+
+static void gradient_rect_rows(void *arg, int y0, int y1)
+{
+    const GradRectJob *j = arg;
+    for (int y = y0; y < y1; y++)
+        gradient_span(j->ctx, j->g, y, j->x0, j->x1);
+}
+
+void canvas2d_parallel_rows(void (*fn)(void *, int, int), void *arg, int y0, int y1, long work_px)
+{
+    par_rows(fn, arg, y0, y1, work_px);
+}
+
+typedef struct {
+    Canvas2DCtx *ctx;
+    int          x0, x1;
+    uint8_t      rgba[4];
+    float        ga;
+    int          comp;
+} SolidJob;
+
+static void solid_rows(void *arg, int y0, int y1)
+{
+    const SolidJob *j = arg;
+    for (int y = y0; y < y1; y++)
+        fill_span(j->ctx->pixels + ((size_t)y * j->ctx->width + j->x0) * 4, j->x1 - j->x0,
+                  j->rgba[0], j->rgba[1], j->rgba[2], j->rgba[3], j->ga, j->comp);
+}
+
+void canvas2d_fill_gradient_rect(Canvas2DHandle h, int x, int y, int w, int h2, bool radial,
+                                 double p0, double p1, double p2, double p3,
+                                 const double *offsets, const uint8_t *rgba, int n)
+{
+    Canvas2DCtx *ctx = find_ctx(h);
+    if (!ctx || w <= 0 || h2 <= 0 || n <= 0) return;
+
+    int x0 = clampi(x, 0, ctx->width);
+    int y0 = clampi(y, 0, ctx->height);
+    int x1 = clampi((int)((int64_t)x + w), 0, ctx->width);
+    int y1 = clampi((int)((int64_t)y + h2), 0, ctx->height);
+    if (x0 >= x1 || y0 >= y1) return;
+
+    GradientPaint *g = malloc(sizeof(GradientPaint));
+    if (!g) return;
+    gradient_init(g, radial, p0, p1, p2, p3, offsets, rgba, n);
+    gradient_finish(ctx, g);
+    if (gradient_is_uniform(g)) {
+        /* One colour everywhere (a single colour stop, as the lighting plugin uses for its flat fills): no need
+           to work out the position of every pixel. */
+        SolidJob sj = { ctx, x0, x1, { g->lut[0][0], g->lut[0][1], g->lut[0][2], g->lut[0][3] },
+                        ctx->state.global_alpha, ctx->state.composite_op };
+        par_rows(solid_rows, &sj, y0, y1, (long)(x1 - x0) * (y1 - y0));
+        gradient_free(g);
+        return;
+    }
+    GradRectJob job = { ctx, g, x0, x1 };
+    par_rows(gradient_rect_rows, &job, y0, y1, (long)(x1 - x0) * (y1 - y0));
+    gradient_free(g);
+}
+
+typedef struct { double y0, y1, x0, dxdy; int dir; } PathEdge;
+
+static int path_x_cmp(const void *a, const void *b)
+{
+    double d = ((const double *)a)[0] - ((const double *)b)[0];
+    return d > 0 ? 1 : (d < 0 ? -1 : 0);
+}
+
+typedef struct {
+    Canvas2DCtx        *ctx;
+    const PathEdge     *edges;
+    int                 ne;
+    int                 xa_lim, xb_lim;
+    const GradientPaint *grad;   /* NULL: solid colour */
+} PathJob;
+
+/* Fills rows [ya, yb) of a polygon set (see fill_path_impl). */
+static void path_rows(void *arg, int ya, int yb)
+{
+    const PathJob *j = arg;
+    Canvas2DCtx *ctx = j->ctx;
+    double *xs = malloc((size_t)j->ne * 2 * sizeof(double));
+    if (!xs) return;
+
+    uint8_t fr = ctx->state.fill_r, fg = ctx->state.fill_g, fb = ctx->state.fill_b, fa = ctx->state.fill_a;
+    float ga = ctx->state.global_alpha;
+    int comp = ctx->state.composite_op;
+
+    for (int y = ya; y < yb; y++) {
+        double sy = y + 0.5;
+        int nx = 0;
+        for (int e = 0; e < j->ne; e++) {
+            if (sy >= j->edges[e].y0 && sy < j->edges[e].y1) {
+                xs[2 * nx] = j->edges[e].x0 + (sy - j->edges[e].y0) * j->edges[e].dxdy;
+                xs[2 * nx + 1] = j->edges[e].dir;
+                nx++;
+            }
+        }
+        if (nx < 2) continue;
+        qsort(xs, (size_t)nx, 2 * sizeof(double), path_x_cmp);
+        int wind = 0;
+        double span_start = 0;
+        for (int k = 0; k < nx; k++) {
+            int prev = wind;
+            wind += (int)xs[2 * k + 1];
+            if (prev == 0 && wind != 0) {
+                span_start = xs[2 * k];
+            } else if (prev != 0 && wind == 0) {
+                int xa = (int)lround(span_start), xb = (int)lround(xs[2 * k]);
+                if (xa < j->xa_lim) xa = j->xa_lim;
+                if (xb > j->xb_lim) xb = j->xb_lim;
+                if (xb <= xa) continue;
+                if (j->grad) {
+                    gradient_span(ctx, j->grad, y, xa, xb);
+                } else {
+                    fill_span(ctx->pixels + ((size_t)y * ctx->width + xa) * 4, xb - xa, fr, fg, fb, fa, ga, comp);
+                }
+            }
+        }
+    }
+    free(xs);
+}
+
+/* Scanline fill of polygons (nonzero winding, every subpath implicitly closed), like the JS rasteriser
+   this replaces: pixel rows are sampled at their centre, span ends are rounded, no anti-aliasing.
+   pts holds x,y pairs, counts the number of points of each subpath. With grad == NULL the current fill
+   colour is used. */
+static void fill_path_impl(Canvas2DCtx *ctx, const double *pts, const int *counts, int nsub,
+                           bool has_clip, int clip_x, int clip_y, int clip_w, int clip_h,
+                           const GradientPaint *grad)
+{
+    size_t total = 0;
+    for (int s = 0; s < nsub; s++) if (counts[s] >= 3) total += (size_t)counts[s];
+    if (total == 0) return;
+    PathEdge *edges = malloc(total * sizeof(PathEdge));
+    if (!edges) return;
+
+    int ne = 0;
+    double min_y = 1e300, max_y = -1e300, min_x = 1e300, max_x = -1e300;
+    const double *p = pts;
+    for (int s = 0; s < nsub; s++) {
+        int n = counts[s];
+        if (n < 3) { p += 2 * (size_t)n; continue; }
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            double x0 = p[2 * i], y0 = p[2 * i + 1], x1 = p[2 * j], y1 = p[2 * j + 1];
+            if (x0 < min_x) min_x = x0;
+            if (x0 > max_x) max_x = x0;
+            if (y0 == y1) continue;
+            int dir = 1;
+            if (y0 > y1) {
+                double t = x0; x0 = x1; x1 = t;
+                t = y0; y0 = y1; y1 = t;
+                dir = -1;
+            }
+            edges[ne].y0 = y0; edges[ne].y1 = y1; edges[ne].x0 = x0;
+            edges[ne].dxdy = (x1 - x0) / (y1 - y0); edges[ne].dir = dir;
+            ne++;
+            if (y0 < min_y) min_y = y0;
+            if (y1 > max_y) max_y = y1;
+        }
+        p += 2 * (size_t)n;
+    }
+    if (ne == 0) { free(edges); return; }
+
+    int ch = ctx->height, cw = ctx->width;
+    int ya = 0, yb = ch, xa_lim = 0, xb_lim = cw;
+    if (has_clip) {
+        if (clip_y > ya) ya = clip_y;
+        if (clip_y + clip_h < yb) yb = clip_y + clip_h;
+        if (clip_x > xa_lim) xa_lim = clip_x;
+        if (clip_x + clip_w < xb_lim) xb_lim = clip_x + clip_w;
+    }
+    if (floor(min_y) > ya) ya = (int)floor(min_y);
+    if (ceil(max_y) < yb) yb = (int)ceil(max_y);
+
+    PathJob job = { ctx, edges, ne, xa_lim, xb_lim, grad };
+    if (ya < yb) {
+        double wpx = (max_x - min_x) * (double)(yb - ya);
+        par_rows(path_rows, &job, ya, yb, wpx > 1e9 ? 1000000000L : (long)wpx);
+    }
+    free(edges);
+}
+
+void canvas2d_fill_path(Canvas2DHandle h, const double *pts, const int *counts, int nsub,
+                        bool has_clip, int clip_x, int clip_y, int clip_w, int clip_h,
+                        int gradient_kind, double p0, double p1, double p2, double p3,
+                        const double *offsets, const uint8_t *rgba, int n)
+{
+    Canvas2DCtx *ctx = find_ctx(h);
+    if (!ctx || nsub <= 0) return;
+    if (gradient_kind < 0 || n <= 0) {
+        fill_path_impl(ctx, pts, counts, nsub, has_clip, clip_x, clip_y, clip_w, clip_h, NULL);
+        return;
+    }
+    GradientPaint *g = malloc(sizeof(GradientPaint));
+    if (!g) return;
+    gradient_init(g, gradient_kind == 1, p0, p1, p2, p3, offsets, rgba, n);
+    gradient_finish(ctx, g);
+    fill_path_impl(ctx, pts, counts, nsub, has_clip, clip_x, clip_y, clip_w, clip_h, g);
+    gradient_free(g);
 }
 
 void canvas2d_clear_rect(Canvas2DHandle h, int x, int y, int w, int h2)
@@ -552,6 +1353,7 @@ void canvas2d_draw_image(Canvas2DHandle h,
 
     float ga = ctx->state.global_alpha;
     int comp = ctx->state.composite_op;
+    int clears = comp_clears_dst(comp);
 
     for (int py = 0; py < dh; py++) {
         int dst_y = dy + py;
@@ -560,20 +1362,56 @@ void canvas2d_draw_image(Canvas2DHandle h,
         for (int px = 0; px < dw; px++) {
             int dst_x = dx + px;
             if (dst_x < 0 || dst_x >= ctx->width) continue;
+            uint8_t *d = ctx->pixels + ((size_t)dst_y * ctx->width + dst_x) * 4;
 
             /* Nearest-neighbor sampling; int64 avoids overflow. */
             int src_x = sx + (int)(((int64_t)px * sw) / dw);
             int src_y = sy + (int)(((int64_t)py * sh) / dh);
-            if (src_x < 0 || src_x >= src_w || src_y < 0 || src_y >= src_h) continue;
+            if (src_x < 0 || src_x >= src_w || src_y < 0 || src_y >= src_h) {
+                if (clears) d[0] = d[1] = d[2] = d[3] = 0; /* nothing to draw here: an empty source */
+                continue;
+            }
 
             const uint8_t *s = src_pixels + ((size_t)src_y * src_w + src_x) * 4;
-            uint8_t *d = ctx->pixels + ((size_t)dst_y * ctx->width + dst_x) * 4;
             blend_pixel(d, s[0], s[1], s[2], s[3], ga, comp);
         }
+    }
+    if (clears) {
+        /* destination-in, copy and friends also clear everything outside the drawn rectangle */
+        int cx0 = clampi(dx, 0, ctx->width), cy0 = clampi(dy, 0, ctx->height);
+        int cx1 = clampi((int)((int64_t)dx + dw), 0, ctx->width), cy1 = clampi((int)((int64_t)dy + dh), 0, ctx->height);
+        clear_outside(ctx, cx0, cy0, cx1, cy1);
     }
 }
 
 /* Pixel manipulation */
+
+/* Adds r, g, b to the colour channels of every pixel, clamped to 0..255 (alpha untouched): what RPG Maker MV's
+   Bitmap.adjustTone does with a getImageData / put-back loop, which is a typed-array pass of about a million
+   steps for a window background in an interpreter. Uint8ClampedArray stores round to nearest, ties to even. */
+void canvas2d_adjust_tone(Canvas2DHandle h, double r, double g, double b)
+{
+    Canvas2DCtx *ctx = find_ctx(h);
+    if (!ctx || !ctx->pixels || ctx->width <= 0 || ctx->height <= 0) return;
+    uint8_t lut[3][256];
+    const double add[3] = { r, g, b };
+    for (int c = 0; c < 3; c++) {
+        for (int v = 0; v < 256; v++) {
+            double x = (double)v + add[c];
+            if (x != x) x = 0;                  /* NaN stores as 0 */
+            if (x < 0) x = 0;
+            if (x > 255) x = 255;
+            lut[c][v] = (uint8_t)nearbyint(x);  /* default rounding mode: to nearest, ties to even */
+        }
+    }
+    uint8_t *p = ctx->pixels;
+    size_t n = (size_t)ctx->width * (size_t)ctx->height;
+    for (size_t i = 0; i < n; i++, p += 4) {
+        p[0] = lut[0][p[0]];
+        p[1] = lut[1][p[1]];
+        p[2] = lut[2][p[2]];
+    }
+}
 
 void canvas2d_get_image_data(Canvas2DHandle h, int x, int y, int w, int h2,
                               uint8_t *out)
@@ -811,6 +1649,7 @@ static FontEntry *load_fallback_font(size_t i)
 typedef struct {
     FontEntry *fe;
     int        glyph;     /* 0 = notdef in fe */
+    int        blank;     /* whitespace/control character that no font has a glyph for: draw nothing */
 } GlyphRef;
 
 /* The font that can draw `cp`: the requested font, another game font, or a
@@ -818,20 +1657,23 @@ typedef struct {
    requested font so their advances match its metrics. */
 static GlyphRef resolve_glyph(FontEntry *primary, int cp)
 {
-    GlyphRef r = { primary, stbtt_FindGlyphIndex(&primary->info, cp) };
-    if (r.glyph || cp <= 0x20 || cp == 0x3000 || cp == 0xA0) return r;
+    GlyphRef r = { primary, stbtt_FindGlyphIndex(&primary->info, cp), 0 };
+    if (r.glyph) return r;
+    int whitespace = cp <= 0x20 || cp == 0x3000 || cp == 0xA0 || (cp >= 0x7F && cp < 0xA0);
+    if (whitespace) r.blank = 1; /* if nothing below finds a glyph, the .notdef box must not be drawn */
+    if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0)) return r;  /* control characters: nothing to look for */
 
     for (int i = 0; i < s_font_count; i++) {
         FontEntry *fe = &s_fonts[i];
         if (!fe->valid || fe == primary) continue;
         int g = stbtt_FindGlyphIndex(&fe->info, cp);
-        if (g) { r.fe = fe; r.glyph = g; return r; }
+        if (g) { r.fe = fe; r.glyph = g; r.blank = 0; return r; }
     }
     for (size_t i = 0; i < SYSTEM_FALLBACK_COUNT; i++) {
         FontEntry *fe = load_fallback_font(i);
         if (!fe) continue;
         int g = stbtt_FindGlyphIndex(&fe->info, cp);
-        if (g) { r.fe = fe; r.glyph = g; return r; }
+        if (g) { r.fe = fe; r.glyph = g; r.blank = 0; return r; }
     }
     return r;
 }
@@ -845,7 +1687,8 @@ static float glyph_advance(FontEntry *primary, float pixel_size, int cp, int nex
     int advance, lsb;
     stbtt_GetGlyphHMetrics(&g.fe->info, g.glyph, &advance, &lsb);
     float width = advance * scale;
-    if (next_cp) {
+    if (g.blank && !g.glyph) width = cp < 0x20 ? 0.0f : pixel_size * 0.28f; /* no glyph anywhere: a plain gap */
+    if (next_cp && !(g.blank && !g.glyph)) {
         GlyphRef n = resolve_glyph(primary, next_cp);
         if (n.fe == g.fe) {
             width += stbtt_GetGlyphKernAdvance(&g.fe->info, g.glyph, n.glyph) * scale;
@@ -889,6 +1732,49 @@ float canvas2d_measure_text(Canvas2DHandle h, const char *text)
     }
 
     return measure_text_internal(fe, ctx->state.font_size, text);
+}
+
+/* Bounding box of the drawn glyphs of `text`, relative to the start of the text on the baseline: out[0] = how far it
+   reaches to the left of the start, out[1] = right edge, out[2] = ascent above the baseline, out[3] = descent below it
+   (the actualBoundingBox* values of measureText). Returns false when there is no font. */
+bool canvas2d_measure_text_bounds(Canvas2DHandle h, const char *text, float out[4])
+{
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    Canvas2DCtx *ctx = find_ctx(h);
+    if (!ctx || !text) return false;
+
+    FontEntry *fe = find_font(ctx->state.font_name);
+    for (int i = 0; !fe && i < s_font_count; i++) {
+        if (s_fonts[i].valid) fe = &s_fonts[i];
+    }
+    if (!fe) return false;
+
+    float pen = 0.0f, min_x = 0.0f, max_x = 0.0f, ascent = 0.0f, descent = 0.0f;
+    bool any = false;
+    const char *p = text;
+    while (*p) {
+        int cp = utf8_next(&p);
+        GlyphRef g;
+        float adv = glyph_advance(fe, ctx->state.font_size, cp, utf8_peek(p), &g);
+        float scale = stbtt_ScaleForMappingEmToPixels(&g.fe->info, ctx->state.font_size);
+        int x0, y0, x1, y1;
+        stbtt_GetGlyphBitmapBox(&g.fe->info, g.glyph, scale, scale, &x0, &y0, &x1, &y1);
+        if (!g.blank && x1 > x0 && y1 > y0) {
+            if (!any || pen + x0 < min_x) min_x = pen + x0;
+            if (!any || pen + x1 > max_x) max_x = pen + x1;
+            if (-y0 > ascent) ascent = (float)-y0;
+            if (y1 > descent) descent = (float)y1;
+            any = true;
+        }
+        pen += adv;
+    }
+    if (any) {
+        out[0] = -min_x;
+        out[1] = max_x;
+        out[2] = ascent;
+        out[3] = descent;
+    }
+    return true;
 }
 
 /* Browser text rasterizers (Skia/DirectWrite) boost partial coverage so
@@ -991,7 +1877,7 @@ static void draw_text(Canvas2DCtx *ctx, const char *text, float x, float y,
         float gscale = stbtt_ScaleForMappingEmToPixels(&g.fe->info, pixel_size);
 
         int gw, gh, gx, gy;
-        uint8_t *bitmap = stbtt_GetGlyphBitmap(&g.fe->info, 0, gscale,
+        uint8_t *bitmap = g.blank ? NULL : stbtt_GetGlyphBitmap(&g.fe->info, 0, gscale,
                                                 g.glyph, &gw, &gh, &gx, &gy);
         if (bitmap && stroke_radius > 0.0f) {
             int margin = 0;

@@ -4,8 +4,11 @@
  */
 
 #include "engine/js_engine.h"
+#include "engine/error_handler.h"
+#include "engine/js_pool_alloc.h"
 
 #include <quickjs.h>
+#include <quickjs-libc.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +42,12 @@ struct JSEngine {
        than watchdog_ms since the last arm. */
     unsigned watchdog_ms;
     uint64_t watchdog_armed_ms;
+
+    /* Sampling profiler (debug aid, 0 = off): see profile_interrupt(). */
+    unsigned profile_ms;
+    uint64_t profile_last_us;
+    uint64_t profile_report_us;
+    double   profile_total_ms;
 };
 
 static uint64_t monotonic_ms(void)
@@ -54,12 +63,284 @@ static uint64_t monotonic_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+/* ---- sampling profiler ---------------------------------------------------------------------------
+   QuickJS calls the interrupt handler every few thousand bytecode operations. Each time at least profile_ms
+   have passed since the previous sample, the current script stack is recorded and charged with the time
+   that passed. Time spent in native code (drawing on a canvas, decoding an image, ...) is charged to the
+   script function that called it, because the handler only runs again once that function is executing.
+   Every 10 seconds the most expensive stacks are printed and the counters are reset. */
+
+#define PROF_MAX 1024
+#define PROF_KEY 220
+
+typedef struct {
+    char     key[PROF_KEY];
+    double   ms;
+    unsigned samples;
+} ProfEntry;
+
+int rmmz_prof_enabled;
+const char *volatile rmmz_prof_active[8];
+volatile int rmmz_prof_depth;
+volatile uint64_t rmmz_frame_us;
+
+uint64_t rmmz_prof_now_us(void);
+
+typedef struct { const char *name; uint64_t us; uint64_t calls; } NativeProf;
+static NativeProf native_prof[160];
+static int native_prof_count;
+
+void rmmz_prof_add(const char *name, uint64_t us)
+{
+    for (int i = 0; i < native_prof_count; i++) {
+        if (native_prof[i].name == name) {
+            native_prof[i].us += us;
+            native_prof[i].calls++;
+            return;
+        }
+    }
+    if (native_prof_count < 160) {
+        native_prof[native_prof_count].name = name;
+        native_prof[native_prof_count].us = us;
+        native_prof[native_prof_count].calls = 1;
+        native_prof_count++;
+    }
+}
+
+static int native_prof_cmp(const void *a, const void *b)
+{
+    int64_t d = (int64_t)((const NativeProf *)b)->us - (int64_t)((const NativeProf *)a)->us;
+    return d > 0 ? 1 : (d < 0 ? -1 : 0);
+}
+
+static double prof_overhead_ms, prof_overhead_worst_ms;
+static unsigned prof_overhead_samples;
+static ProfEntry prof_tables[3][PROF_MAX];
+static int prof_counts[3];
+#define prof_table prof_tables[0]
+#define prof_count prof_counts[0]
+
+uint64_t rmmz_prof_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static uint64_t monotonic_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* "    at name (file:line:col)" lines -> "name(file:line) < name2(file:line) < ..." for the first n frames */
+static void prof_make_key(const char *stack, char *out, size_t out_size, int frames)
+{
+    size_t o = 0;
+    const char *p = stack;
+    out[0] = '\0';
+    for (int f = 0; f < frames && *p; f++) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        while (len > 0 && (*p == ' ' || *p == '\t')) { p++; len--; }
+        if (len > 3 && strncmp(p, "at ", 3) == 0) { p += 3; len -= 3; }
+        /* Shorten long paths to the last two components. */
+        const char *paren = memchr(p, '(', len);
+        if (paren) {
+            const char *q = paren + 1, *last = q, *prev = q;
+            const char *e = p + len;
+            for (const char *c = q; c < e; c++) {
+                if (*c == '/') { prev = last; last = c + 1; }
+            }
+            char part[200];
+            int n = snprintf(part, sizeof(part), "%.*s(%.*s", (int)(paren - p), p, (int)(e - prev), prev);
+            if (n > 0 && o + (size_t)n + 4 < out_size) {
+                if (o) { memcpy(out + o, " < ", 3); o += 3; }
+                memcpy(out + o, part, (size_t)n);
+                o += (size_t)n;
+            }
+        } else if (len > 0 && o + len + 4 < out_size) {
+            if (o) { memcpy(out + o, " < ", 3); o += 3; }
+            memcpy(out + o, p, len);
+            o += len;
+        }
+        out[o] = '\0';
+        p = eol ? eol + 1 : p + len;
+    }
+}
+
+static int prof_cmp(const void *a, const void *b)
+{
+    double d = ((const ProfEntry *)b)->ms - ((const ProfEntry *)a)->ms;
+    return d > 0 ? 1 : (d < 0 ? -1 : 0);
+}
+
+static void prof_report(JSEngine *engine)
+{
+    static const char *titles[3] = {
+        "top script stacks", "time per file (innermost frame)", "time per function in game code (not shims)"
+    };
+    static const int limits[3] = { 15, 15, 20 };
+    double total = engine->profile_total_ms > 0 ? engine->profile_total_ms : 1;
+    {
+        JSMemoryUsage mu;
+        JS_ComputeMemoryUsage(engine->rt, &mu);
+        error_handler_log(LOG_INFO, "[profile] heap: %.1f MB in %lld blocks; %lld objects, %lld strings, %lld atoms, %lld shapes, "
+                "%lld js functions, %lld arrays (%lld fast)",
+                mu.malloc_size / 1048576.0, (long long)mu.malloc_count, (long long)mu.obj_count,
+                (long long)mu.str_count, (long long)mu.atom_count, (long long)mu.shape_count,
+                (long long)mu.js_func_count, (long long)mu.array_count, (long long)mu.fast_array_count);
+    }
+    for (int t = 0; t < 3; t++) {
+        if (prof_counts[t] == 0) continue;
+        qsort(prof_tables[t], (size_t)prof_counts[t], sizeof(ProfEntry), prof_cmp);
+        error_handler_log(LOG_INFO, "[profile] ---- %s over the last %.1f s (charged time, ms) ----",
+                titles[t], engine->profile_total_ms / 1000.0);
+        for (int i = 0; i < prof_counts[t] && i < limits[t]; i++) {
+            error_handler_log(LOG_INFO, "[profile] %5.1f%% %8.1f ms %5u  %s",
+                    100.0 * prof_tables[t][i].ms / total,
+                    prof_tables[t][i].ms, prof_tables[t][i].samples, prof_tables[t][i].key);
+        }
+        prof_counts[t] = 0;
+    }
+    if (native_prof_count > 0) {
+        qsort(native_prof, (size_t)native_prof_count, sizeof(NativeProf), native_prof_cmp);
+        error_handler_log(LOG_INFO, "[profile] ---- native calls (time inside, ms; includes nested calls) ----");
+        for (int i = 0; i < native_prof_count && i < 22; i++) {
+            error_handler_log(LOG_INFO, "[profile] %8.1f ms %8llu calls %8.1f us/call  %s", native_prof[i].us / 1000.0,
+                    (unsigned long long)native_prof[i].calls,
+                    native_prof[i].calls ? (double)native_prof[i].us / (double)native_prof[i].calls : 0.0,
+                    native_prof[i].name);
+        }
+        native_prof_count = 0;
+    }
+    engine->profile_total_ms = 0;
+}
+
+static void prof_add(int t, const char *key, double dt_ms)
+{
+    ProfEntry *tab = prof_tables[t];
+    for (int i = 0; i < prof_counts[t]; i++) {
+        if (strcmp(tab[i].key, key) == 0) {
+            tab[i].ms += dt_ms;
+            tab[i].samples++;
+            return;
+        }
+    }
+    if (prof_counts[t] < PROF_MAX) {
+        snprintf(tab[prof_counts[t]].key, PROF_KEY, "%s", key);
+        tab[prof_counts[t]].ms = dt_ms;
+        tab[prof_counts[t]].samples = 1;
+        prof_counts[t]++;
+    }
+}
+
+/* Innermost frame: "name (file:line:col)" -> file (basename) and, for game code, "name(file:line)". */
+static void prof_frames(const char *stack, char *file_key, size_t fk, char *game_key, size_t gk)
+{
+    file_key[0] = '\0';
+    game_key[0] = '\0';
+    const char *p = stack;
+    int first = 1;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        char line[300];
+        size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+        memcpy(line, p, n);
+        line[n] = '\0';
+        p = eol ? eol + 1 : p + len;
+        char *paren = strchr(line, '(');
+        char *close = strrchr(line, ')');
+        if (!paren || !close || close < paren) continue;   /* "(native)" style frames have no file */
+        *close = '\0';
+        const char *path = paren + 1;
+        if (strcmp(path, "native") == 0 || strcmp(path, "missing") == 0) continue;
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        char fbuf[200];
+        snprintf(fbuf, sizeof(fbuf), "%s", base);
+        char *colon = strchr(fbuf, ':');
+        if (colon) *colon = '\0';
+        char name[100];
+        const char *at = line;
+        while (*at == ' ') at++;
+        if (strncmp(at, "at ", 3) == 0) at += 3;
+        size_t nl = (size_t)(paren - at);
+        while (nl > 0 && at[nl - 1] == ' ') nl--;
+        snprintf(name, sizeof(name), "%.*s", (int)nl, at);
+        if (first) {
+            snprintf(file_key, fk, "%s", fbuf);
+            first = 0;
+        }
+        if (!strstr(path, "shims/")) {
+            snprintf(game_key, gk, "%s (%s)", name, base);
+            return;
+        }
+    }
+}
+
+static void profile_sample(JSEngine *engine, double dt_ms)
+{
+    JSContext *ctx = engine->ctx;
+    JSValue err = JS_NewError(ctx);
+    JSValue st = JS_GetPropertyStr(ctx, err, "stack");
+    const char *stack = JS_IsString(st) ? JS_ToCString(ctx, st) : NULL;
+    char key[PROF_KEY], file_key[PROF_KEY], game_key[PROF_KEY];
+    file_key[0] = game_key[0] = '\0';
+    if (stack) {
+        prof_make_key(stack, key, sizeof(key), 3);
+        prof_frames(stack, file_key, sizeof(file_key), game_key, sizeof(game_key));
+    } else {
+        snprintf(key, sizeof(key), "(no stack)");
+    }
+    if (stack) JS_FreeCString(ctx, stack);
+    JS_FreeValue(ctx, st);
+    JS_FreeValue(ctx, err);
+
+    engine->profile_total_ms += dt_ms;
+    prof_add(0, key, dt_ms);
+    prof_add(1, file_key[0] ? file_key : "(native / no file)", dt_ms);
+    prof_add(2, game_key[0] ? game_key : "(shims / native only)", dt_ms);
+}
+
 /* Called periodically by QuickJS while JS runs. Returning 1 raises an
    uncatchable InternalError, so the stack trace shows where the script was. */
 static int watchdog_interrupt(JSRuntime *rt, void *opaque)
 {
     (void)rt;
     JSEngine *engine = opaque;
+
+    if (engine->profile_ms) {
+        uint64_t now_us = monotonic_us();
+        if (engine->profile_last_us == 0) {
+            engine->profile_last_us = now_us;
+            engine->profile_report_us = now_us;
+        } else if (now_us - engine->profile_last_us >= (uint64_t)engine->profile_ms * 1000u) {
+            profile_sample(engine, (double)(now_us - engine->profile_last_us) / 1000.0);
+            uint64_t after = monotonic_us();
+            double sample_ms = (double)(after - now_us) / 1000.0;
+            prof_overhead_ms += sample_ms;
+            prof_overhead_samples++;
+            if (sample_ms > prof_overhead_worst_ms) prof_overhead_worst_ms = sample_ms;
+            engine->profile_last_us = after;
+            if (after - engine->profile_report_us >= 10000000u) {
+                uint64_t r0 = monotonic_us();
+                prof_report(engine);
+                uint64_t r1 = monotonic_us();
+                error_handler_log(LOG_INFO, "[profile] overhead of profiling in this window: %u samples took %.0f ms "
+                        "(%.2f ms each, worst %.1f ms); printing the report took %.0f ms",
+                        prof_overhead_samples, prof_overhead_ms,
+                        prof_overhead_samples ? prof_overhead_ms / prof_overhead_samples : 0.0,
+                        prof_overhead_worst_ms, (double)(r1 - r0) / 1000.0);
+                prof_overhead_ms = prof_overhead_worst_ms = 0;
+                prof_overhead_samples = 0;
+                engine->profile_report_us = monotonic_us();
+            }
+        }
+    }
+
     if (!engine->watchdog_ms) return 0;
     uint64_t now = monotonic_ms();
     if (now - engine->watchdog_armed_ms > engine->watchdog_ms) {
@@ -76,7 +357,62 @@ void js_engine_set_watchdog(JSEngine *engine, unsigned limit_ms)
     if (!engine) return;
     engine->watchdog_ms = limit_ms;
     engine->watchdog_armed_ms = monotonic_ms();
-    JS_SetInterruptHandler(engine->rt, limit_ms ? watchdog_interrupt : NULL, engine);
+    JS_SetInterruptHandler(engine->rt, (limit_ms || engine->profile_ms) ? watchdog_interrupt : NULL, engine);
+}
+
+/* Stall watchdog (with --profile): the sampler above only runs between bytecode instructions, so a long stretch inside
+   native code shows up as a single sample charged to whatever ran next. This thread notices that the script thread has
+   not reached the sampler for a while and says which native scopes (RMMZ_PROF_SCOPE) it is inside. Scopes that are
+   not instrumented (JSON.parse, String.replace, the collector, ...) show as "none". */
+#include <pthread.h>
+#include <unistd.h>
+
+static void *stall_watchdog(void *arg)
+{
+    JSEngine *engine = arg;
+    int stalled = 0;
+    uint64_t episode_start = 0, last_report = 0;
+    for (;;) {
+        usleep(500 * 1000);
+        uint64_t last = engine->profile_last_us;
+        uint64_t frame = rmmz_frame_us;
+        if (frame > last) last = frame;     /* either the frame loop or the sampler advancing counts as progress */
+        if (last == 0) continue;            /* nothing has run yet (loading) */
+        uint64_t now = monotonic_us();
+        uint64_t gap = now > last ? now - last : 0;
+        if (gap >= 2000000u) {
+            if (!stalled) { stalled = 1; episode_start = last; last_report = 0; }
+            if (now - last_report >= 5000000u) {
+                char where[256];
+                where[0] = '\0';
+                int depth = rmmz_prof_depth;
+                for (int i = 0; i < depth && i < 8; i++) {
+                    const char *n = rmmz_prof_active[i];
+                    if (!n) continue;
+                    size_t used = strlen(where);
+                    snprintf(where + used, sizeof where - used, "%s%s", used ? " > " : "", n);
+                }
+                printf("[stall] no frame or script progress for %.1f s; inside native: %s (depth %d)\n",
+                       (double)gap / 1e6, where[0] ? where : "none", depth);
+                fflush(stdout);
+                last_report = now;
+            }
+        } else if (stalled) {
+            printf("[stall] ended after about %.1f s\n", (double)(last - episode_start) / 1e6);
+            fflush(stdout);
+            stalled = 0;
+        }
+    }
+    return NULL;
+}
+
+void js_engine_set_profile(JSEngine *engine, unsigned interval_ms)
+{
+    if (!engine) return;
+    engine->profile_ms = interval_ms;
+    rmmz_prof_enabled = interval_ms > 0;
+    engine->profile_last_us = 0;
+    JS_SetInterruptHandler(engine->rt, (interval_ms || engine->watchdog_ms) ? watchdog_interrupt : NULL, engine);
 }
 
 void js_engine_watchdog_arm(JSEngine *engine)
@@ -190,7 +526,7 @@ static void js_dump_exception(JSEngine *engine, JSContext *ctx)
         JS_FreeCString(ctx, str);
     }
 
-    if (JS_IsError(ctx, exc)) {
+    if (JS_IsError(exc)) {
         JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
         if (!JS_IsUndefined(stack)) {
             const char *stack_str = JS_ToCString(ctx, stack);
@@ -300,7 +636,15 @@ static void flush_unhandled_rejections(JSEngine *engine)
 
 JSEngine *js_engine_init(void)
 {
+#ifdef RMMZ_PS5
+    /* The console's malloc is several times slower than a PC's for the small, short-lived blocks QuickJS
+       allocates all the time (see js_pool_alloc.h). RMMZ_SYSTEM_MALLOC=1 switches back, for comparison. */
+    const char *sys_malloc = getenv("RMMZ_SYSTEM_MALLOC");
+    JSRuntime *rt = (sys_malloc && *sys_malloc == '1') ? JS_NewRuntime()
+                                                        : JS_NewRuntime2(&js_pool_malloc_functions, NULL);
+#else
     JSRuntime *rt = JS_NewRuntime();
+#endif
     if (!rt) {
         fprintf(stderr, "Failed to create JS runtime\n");
         return NULL;
@@ -308,6 +652,14 @@ JSEngine *js_engine_init(void)
 
     JS_SetMemoryLimit(rt, JS_MEMORY_LIMIT);
     JS_SetMaxStackSize(rt, JS_STACK_SIZE);
+    /* dynamic import() and static import in a plugin (Plug2in loads libPlug2in.js this way): modules come from files
+       next to the importing script, names resolved the usual way */
+    JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader, js_module_check_attributes, NULL);
+    {
+        /* Experiment: RMMZ_GC_THRESHOLD_MB raises the size at which the cycle collector first runs. */
+        const char *gc = getenv("RMMZ_GC_THRESHOLD_MB");
+        if (gc && atoi(gc) > 0) JS_SetGCThreshold(rt, (size_t)atoi(gc) * 1024 * 1024);
+    }
 
     JSContext *ctx = JS_NewContext(rt);
     if (!ctx) {
@@ -332,6 +684,10 @@ JSEngine *js_engine_init(void)
 
     js_register_console(ctx);
 
+    {
+        pthread_t wd;
+        if (pthread_create(&wd, NULL, stall_watchdog, engine) == 0) pthread_detach(wd);
+    }
     return engine;
 }
 
