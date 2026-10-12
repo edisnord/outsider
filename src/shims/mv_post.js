@@ -87,27 +87,6 @@
         if (typeof sp.updateToneChanger === "function") sp.updateToneChanger = asWebGL(sp.updateToneChanger);
     }
 
-    /* Diagnostic: windows as wide as the screen that are being shown. MV has a few by design (help, message and log
-       windows); one that is not meant to be wide shows up here with the scene, size and opacities it had. Reported once
-       per window class and scene, to the compat log. */
-    if (typeof Window_Base !== "undefined" && typeof globalThis.__compat_report === "function") {
-        var realWindowUpdate = Window_Base.prototype.update;
-        Window_Base.prototype.update = function() {
-            var r = realWindowUpdate.apply(this, arguments);
-            try {
-                if (this.visible && this.openness > 0 && this.width >= Graphics.width * 0.9) {
-                    var scene = (SceneManager._scene && SceneManager._scene.constructor && SceneManager._scene.constructor.name) || "?";
-                    var cls = (this.constructor && this.constructor.name) || "?";
-                    globalThis.__compat_report("window", cls + " full width in " + scene,
-                        this.width + "x" + this.height + " at " + this.x + "," + this.y + ", openness " + this.openness +
-                        ", opacity " + this.opacity + ", back " + this.backOpacity + ", contents " + this.contentsOpacity +
-                        ", active " + this.active);
-                }
-            } catch (e) { /* diagnostic only */ }
-            return r;
-        };
-    }
-
     var html = readText("index.html");
     if (!html) return;
 
