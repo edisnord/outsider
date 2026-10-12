@@ -82,7 +82,21 @@ typedef struct {
     JSCFunction *fn;
     JSCFunctionMagic *mfn;
     int magic;
+    const char *name;     /* for the stall watchdog and slow-call reports; the string lives as long as the function */
 } FnData;
+
+/* The native function the script thread is in, and since when (read by the stall watchdog thread, which prints it
+   with a stall: "no frame progress for 36 s, inside native call create"). Outermost call only. */
+const char *volatile rmmz_native_name;
+volatile uint64_t rmmz_native_since_us;
+extern void compat_report(const char *category, const char *key, const char *fmt, ...);
+
+static uint64_t native_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
 typedef struct {
     JSClassID id;
@@ -218,7 +232,12 @@ void JS_FreeRuntime(JSRuntime *rt)
     free(rt);
 }
 
-static void fn_finalize(JSObjectRef o) { free(JSObjectGetPrivate(o)); }
+static void fn_finalize(JSObjectRef o)
+{
+    FnData *d = JSObjectGetPrivate(o);
+    if (d) free((void *)d->name);
+    free(d);
+}
 
 static JSValueRef fn_call(JSContextRef cref, JSObjectRef function, JSObjectRef thisObject, size_t argc,
                           const JSValueRef argv[], JSValueRef *exception)
@@ -232,7 +251,20 @@ static JSValueRef fn_call(JSContextRef cref, JSObjectRef function, JSObjectRef t
     for (size_t i = 0; i < argc; i++) args[i] = borrow_ref(ctx, argv[i]);
     JSValue this_v = thisObject ? borrow_ref(ctx, thisObject) : JS_UNDEFINED;
 
+    const char *outer_name = rmmz_native_name;
+    uint64_t t0 = native_now_us();
+    if (!outer_name) {
+        rmmz_native_since_us = t0;
+        rmmz_native_name = d->name ? d->name : "?";
+    }
     JSValue r = d->mfn ? d->mfn(ctx, this_v, (int)argc, args, d->magic) : d->fn(ctx, this_v, (int)argc, args);
+    if (!outer_name) {
+        uint64_t took = native_now_us() - t0;
+        rmmz_native_name = NULL;
+        if (took > 500000u)
+            compat_report("slow-native", d->name ? d->name : "?", "a native call took %.1f s (including what it called)",
+                          (double)took / 1e6);
+    }
     if (args != stack_args) free(args);
 
     if (r.tag == JSV_EXCEPTION) {
@@ -699,6 +731,7 @@ static JSValue new_function(JSContext *ctx, JSCFunction *fn, JSCFunctionMagic *m
     d->fn = fn;
     d->mfn = mfn;
     d->magic = magic;
+    d->name = name ? strdup(name) : NULL;
     JSObjectRef f = JSObjectMake(ctx->g, ctx->rt->func_class, d);
     JSValue v = from_ref(ctx, f);
     if (name) {

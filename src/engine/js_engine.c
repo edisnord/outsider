@@ -82,6 +82,14 @@ typedef struct {
 } ProfEntry;
 
 int rmmz_prof_enabled;
+#ifndef RMMZ_JS_JSC
+/* set by the JavaScriptCore shim (qjs_jsc.c); QuickJS builds have no such hook */
+const char *volatile rmmz_native_name;
+volatile uint64_t rmmz_native_since_us;
+#else
+extern const char *volatile rmmz_native_name;
+extern volatile uint64_t rmmz_native_since_us;
+#endif
 const char *volatile rmmz_prof_active[8];
 volatile int rmmz_prof_depth;
 volatile uint64_t rmmz_frame_us;
@@ -658,8 +666,14 @@ static void *stall_watchdog(void *arg)
                     size_t used = strlen(where);
                     snprintf(where + used, sizeof where - used, "%s%s", used ? " > " : "", n);
                 }
-                printf("[stall] no frame or script progress for %.1f s; inside native: %s (depth %d)\n",
-                       (double)gap / 1e6, where[0] ? where : "none", depth);
+                const char *nn = rmmz_native_name;
+                uint64_t since = rmmz_native_since_us;
+                char call[96];
+                call[0] = '\0';
+                if (nn && since && now > since)
+                    snprintf(call, sizeof call, "; in script-called native %s for %.1f s", nn, (double)(now - since) / 1e6);
+                printf("[stall] no frame or script progress for %.1f s; inside native: %s (depth %d)%s\n",
+                       (double)gap / 1e6, where[0] ? where : "none", depth, call);
                 fflush(stdout);
                 last_report = now;
             }
