@@ -181,6 +181,10 @@
         if (typeof globalThis.__compat_report === "function") globalThis.__compat_report("audio", key, detail);
     }
 
+    var _SHARE_MAX_BYTES = 1 << 20;     /* files up to this size are shared (sound effects, short jingles) */
+    var _SHARE_MAX_ENTRIES = 96;
+    var _sharedBuffers = new Map();     /* content key -> the AudioBuffer that owns the native source */
+
     function _attachNativeHandle(buffer, handle) {
         buffer._nativeHandle = handle;
         if (handle && _audioBufferRegistry) {
@@ -484,6 +488,32 @@
                     data = arrayBuffer;
                 }
 
+                /* A sound effect is decoded again for every play, and a decoded source is only released when the
+                   collector finalizes its wrapper, which in a long run comes far too late for the 512 source slots:
+                   once they were all taken every effect failed to decode (840 failures in one console run). Short
+                   files are decoded once and shared by content. */
+                var cacheKey = null;
+                if (data && data.byteLength > 0 && data.byteLength <= _SHARE_MAX_BYTES) {
+                    var bytes = new Uint8Array(data), h1 = 0x811c9dc5, h2 = 0x12345678;
+                    for (var bi = 0; bi < bytes.length; bi++) {
+                        h1 = Math.imul(h1 ^ bytes[bi], 16777619);
+                        h2 = Math.imul(h2 + bytes[bi], 2246822519) ^ (h2 >>> 13);
+                    }
+                    cacheKey = bytes.length + ":" + (h1 >>> 0) + ":" + (h2 >>> 0);
+                    var shared = _sharedBuffers.get(cacheKey);
+                    if (shared) {
+                        _sharedBuffers.delete(cacheKey);      /* most recently used goes last */
+                        _sharedBuffers.set(cacheKey, shared);
+                        var again = new AudioBuffer({ sampleRate: shared.sampleRate, length: shared.length,
+                                                      numberOfChannels: shared.numberOfChannels });
+                        again.duration = shared.duration;
+                        again._nativeHandle = shared._nativeHandle;
+                        again._owner = shared;                /* keeps the source alive while this wrapper is */
+                        resolve(again);
+                        return;
+                    }
+                }
+
                 var handle = _native.loadFromMemory(data);
                 if (!handle) {
                     _audioNote("decodeAudioData failed", "the native decoder rejected " +
@@ -503,6 +533,11 @@
                 });
                 buffer.duration = duration;
                 _attachNativeHandle(buffer, handle);
+                if (cacheKey) {
+                    _sharedBuffers.set(cacheKey, buffer);
+                    if (_sharedBuffers.size > _SHARE_MAX_ENTRIES)
+                        _sharedBuffers.delete(_sharedBuffers.keys().next().value);
+                }
 
                 resolve(buffer);
             } catch (e) {

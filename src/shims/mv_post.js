@@ -68,6 +68,25 @@
         };
     }
 
+    /* The canvas mode above makes Graphics.isWebGL() false, and MV then tints the screen (Tint Screen, command 223: every
+       fade to black inside an event) with a ToneSprite that draws through the canvas renderer's 2D context, which does not
+       exist here: the tint never appeared. The tone changer is made with the WebGL variant instead, a ToneFilter on the
+       spriteset's base sprite, which Container.render applies with the colour-matrix filter. Only these two methods see
+       isWebGL() as true, so a plugin's own override of them still runs. */
+    if (typeof Spriteset_Base !== "undefined" && typeof ToneFilter !== "undefined" &&
+        typeof Graphics !== "undefined" && typeof Graphics.isWebGL === "function") {
+        var asWebGL = function(fn) {
+            return function() {
+                var saved = Graphics.isWebGL;
+                Graphics.isWebGL = function() { return true; };
+                try { return fn.apply(this, arguments); } finally { Graphics.isWebGL = saved; }
+            };
+        };
+        var sp = Spriteset_Base.prototype;
+        if (typeof sp.createToneChanger === "function") sp.createToneChanger = asWebGL(sp.createToneChanger);
+        if (typeof sp.updateToneChanger === "function") sp.updateToneChanger = asWebGL(sp.updateToneChanger);
+    }
+
     var html = readText("index.html");
     if (!html) return;
 
