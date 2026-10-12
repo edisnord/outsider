@@ -1355,27 +1355,55 @@ void canvas2d_draw_image(Canvas2DHandle h,
     int comp = ctx->state.composite_op;
     int clears = comp_clears_dst(comp);
 
+    /* Nearest-neighbour sampling. The source column of each destination column is worked out once (it used to be
+       an int64 multiply and divide per pixel), and the common cases skip the general blend: an opaque source
+       pixel over, a transparent one under an operator that leaves the destination alone, and 'copy'. */
+    int px0 = dx < 0 ? -dx : 0;
+    int px1 = dw;
+    if (dx + px1 > ctx->width) px1 = ctx->width - dx;
+    if (px1 <= px0) goto clear_part;
+    int span = px1 - px0;
+    int xs_stack[1024];
+    int *xs = span <= 1024 ? xs_stack : malloc((size_t)span * sizeof(int));
+    if (!xs) return;
+    for (int i = 0; i < span; i++) {
+        int sxp = sx + (int)(((int64_t)(px0 + i) * sw) / dw);
+        xs[i] = (sxp < 0 || sxp >= src_w) ? -1 : sxp;
+    }
+    const int full_alpha = ga >= 1.0f;
     for (int py = 0; py < dh; py++) {
         int dst_y = dy + py;
         if (dst_y < 0 || dst_y >= ctx->height) continue;
-
-        for (int px = 0; px < dw; px++) {
-            int dst_x = dx + px;
-            if (dst_x < 0 || dst_x >= ctx->width) continue;
-            uint8_t *d = ctx->pixels + ((size_t)dst_y * ctx->width + dst_x) * 4;
-
-            /* Nearest-neighbor sampling; int64 avoids overflow. */
-            int src_x = sx + (int)(((int64_t)px * sw) / dw);
-            int src_y = sy + (int)(((int64_t)py * sh) / dh);
-            if (src_x < 0 || src_x >= src_w || src_y < 0 || src_y >= src_h) {
-                if (clears) d[0] = d[1] = d[2] = d[3] = 0; /* nothing to draw here: an empty source */
+        int src_y = sy + (int)(((int64_t)py * sh) / dh);
+        uint8_t *drow = ctx->pixels + ((size_t)dst_y * ctx->width + (dx + px0)) * 4;
+        if (src_y < 0 || src_y >= src_h) {
+            if (clears) memset(drow, 0, (size_t)span * 4);
+            continue;
+        }
+        const uint8_t *srow = src_pixels + (size_t)src_y * src_w * 4;
+        for (int i = 0; i < span; i++) {
+            uint8_t *d = drow + (size_t)i * 4;
+            int xx = xs[i];
+            if (xx < 0) {
+                if (clears) d[0] = d[1] = d[2] = d[3] = 0;     /* nothing to draw here: an empty source */
                 continue;
             }
-
-            const uint8_t *s = src_pixels + ((size_t)src_y * src_w + src_x) * 4;
+            const uint8_t *s = srow + (size_t)xx * 4;
+            if (full_alpha) {
+                if (s[3] == 255 && (comp == CANVAS2D_COMP_SOURCE_OVER || comp == CANVAS2D_COMP_COPY)) {
+                    d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255;
+                    continue;
+                }
+                if (s[3] == 0) {
+                    if (clears) d[0] = d[1] = d[2] = d[3] = 0;
+                    continue;
+                }
+            }
             blend_pixel(d, s[0], s[1], s[2], s[3], ga, comp);
         }
     }
+    if (xs != xs_stack) free(xs);
+clear_part:
     if (clears) {
         /* destination-in, copy and friends also clear everything outside the drawn rectangle */
         int cx0 = clampi(dx, 0, ctx->width), cy0 = clampi(dy, 0, ctx->height);
