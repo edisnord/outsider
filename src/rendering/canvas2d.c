@@ -302,6 +302,15 @@ static inline void blend_pixel(uint8_t *dst,
         return;
     }
 
+    if (comp_op == CANVAS2D_COMP_DEST_IN) {
+        /* the general Porter-Duff form reduces to this: the colour stays, the alpha is scaled by the source's (the
+           tint pass of every sprite ends with one over the whole sprite) */
+        int out_a = (dst_a * src_a + 127) / 255;
+        if (out_a <= 0) dst[0] = dst[1] = dst[2] = dst[3] = 0;
+        else dst[3] = (uint8_t)(out_a > 255 ? 255 : out_a);
+        return;
+    }
+
     if (comp_op >= CANVAS2D_COMP_SOURCE_ATOP && comp_op <= CANVAS2D_COMP_DEST_OUT) {
         blend_porter_duff(dst, sr, sg, sb, src_a, comp_op);
         return;
