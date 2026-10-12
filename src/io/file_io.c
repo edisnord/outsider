@@ -227,6 +227,15 @@ bool file_io_resolve_path(const char *relative_path, char *out, size_t out_size)
         relative_path = decoded;
     }
 
+    /* The page the shims present is file:///game/index.html (dom_shim.js), so a script resolving "fonts/x.ttf"
+       against its location gets "/game/fonts/x.ttf". "/game" is that page's root, the game root here, whatever the
+       folder really is (on a console it is /data/games/...; only a host run that mounts the game at /game has
+       a real /game). Without this the game's own fonts failed to load there. */
+    if (s_game_root[0] != '\0' && strncmp(relative_path, "/game", 5) == 0 &&
+        (relative_path[5] == '/' || relative_path[5] == '\0') && !path_has_prefix(relative_path, s_game_root)) {
+        relative_path += relative_path[5] == '/' ? 6 : 5;
+    }
+
     /* Absolute paths are accepted only inside the game root (when one is set). */
     if (relative_path[0] == '/' || relative_path[0] == '\\' ||
         (relative_path[0] != '\0' && relative_path[1] == ':')) {
