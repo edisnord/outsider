@@ -270,18 +270,19 @@
         }
     });
 
+    /* A value the context does not know is ignored, as in a browser (the previous value stays). Strings that a
+       browser would take but this context cannot do are reported; MV's own `textAlign = undefined` (drawText
+       without an alignment) is the ordinary ignored case and is not. */
     Object.defineProperty(CanvasRenderingContext2D.prototype, "globalCompositeOperation", {
         get: function() { return this._globalCompositeOperation; },
         set: function(v) {
-            this._globalCompositeOperation = v;
-            if (this._handle) {
-                var op = _compOps[v];
-                if (op === undefined) {
-                    compat("globalCompositeOperation=" + v, "operation not supported, drawn as source-over");
-                    op = 0;
-                }
-                __native_canvas2d.setCompositeOp(this._handle, op);
+            var op = _compOps[v];
+            if (op === undefined) {
+                if (typeof v === "string") compat("globalCompositeOperation=" + v, "operation not supported, ignored");
+                return;
             }
+            this._globalCompositeOperation = v;
+            if (this._handle) __native_canvas2d.setCompositeOp(this._handle, op);
         }
     });
 
@@ -299,24 +300,26 @@
     Object.defineProperty(CanvasRenderingContext2D.prototype, "textAlign", {
         get: function() { return this._textAlign; },
         set: function(v) {
-            this._textAlign = v;
-            if (this._handle) {
-                var a = _textAligns[v];
-                if (a === undefined) { compat("textAlign=" + v, "unknown value, treated as start"); a = 3; }
-                __native_canvas2d.setTextAlign(this._handle, a);
+            var a = _textAligns[v];
+            if (a === undefined) {
+                if (typeof v === "string") compat("textAlign=" + v, "unknown value, ignored");
+                return;
             }
+            this._textAlign = v;
+            if (this._handle) __native_canvas2d.setTextAlign(this._handle, a);
         }
     });
 
     Object.defineProperty(CanvasRenderingContext2D.prototype, "textBaseline", {
         get: function() { return this._textBaseline; },
         set: function(v) {
-            this._textBaseline = v;
-            if (this._handle) {
-                var b = _textBaselines[v];
-                if (b === undefined) { compat("textBaseline=" + v, "unknown value, treated as alphabetic"); b = 3; }
-                __native_canvas2d.setTextBaseline(this._handle, b);
+            var b = _textBaselines[v];
+            if (b === undefined) {
+                if (typeof v === "string") compat("textBaseline=" + v, "unknown value, ignored");
+                return;
             }
+            this._textBaseline = v;
+            if (this._handle) __native_canvas2d.setTextBaseline(this._handle, b);
         }
     });
 
