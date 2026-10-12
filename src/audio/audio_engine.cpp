@@ -289,7 +289,7 @@ extern "C" bool audio_engine_init(void)
     SoLoud::result res = s_soloud.init(
         SoLoud::Soloud::CLIP_ROUNDOFF,
         SoLoud::Soloud::AUTO,
-        0,                     /* default sample rate */
+        48000,                 /* the PS5 device runs at 48 kHz; SoLoud hands a backend 44100 when asked for 0, which made SDL resample every block */
         0,                     /* default buffer size */
         2                      /* stereo */
     );
