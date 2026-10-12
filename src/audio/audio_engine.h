@@ -30,6 +30,20 @@ typedef uint32_t AudioSourceHandle;
 typedef uint32_t AudioVoice;
 #define AUDIO_VOICE_INVALID 0
 
+/* What the mixer thread saw since the last call (which resets it). */
+typedef struct {
+    uint32_t callbacks;           /* device requests served */
+    uint32_t empty;               /* requests that found nothing queued: silence was played */
+    uint32_t late;                /* requests for more than two blocks: the device ran nearly dry */
+    uint32_t max_mix_us;          /* longest callback, including waiting on SoLoud's lock */
+    uint32_t max_gap_us;          /* longest time between one callback ending and the next starting */
+    uint32_t max_request_frames;  /* largest single request */
+    uint32_t block_frames;
+} AudioBackendStats;
+
+/* False when the SDL3 backend is not in use or nothing was requested. */
+bool audio_backend_take_stats(AudioBackendStats *out);
+
 /* Disable audio globally (call before init): init becomes a no-op and
    playback calls succeed silently. */
 void audio_engine_set_disabled(bool disabled);

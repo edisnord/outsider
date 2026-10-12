@@ -18,8 +18,10 @@
  */
 
 #include "soloud.h"
+#include "audio_engine.h"
 
 #include <SDL3/SDL.h>
+#include <atomic>
 #include <stdlib.h>
 
 namespace SoLoud
@@ -28,6 +30,19 @@ namespace SoLoud
     static float           *gScratch = NULL;
     static unsigned int     gChannels = 2;
     static unsigned int     gBufferFrames = 2048;
+
+    /* Mixer-thread measurements, taken by the main thread through
+       audio_backend_take_stats(). Plain atomics: the callback must never wait
+       on anything the game thread holds. */
+    static std::atomic<uint32_t> gStCallbacks(0), gStEmpty(0), gStLate(0);
+    static std::atomic<uint32_t> gStMaxMixUs(0), gStMaxGapUs(0), gStMaxReqFrames(0);
+    static uint64_t              gLastCallbackEnd = 0;
+
+    static void stat_max(std::atomic<uint32_t> &a, uint32_t v)
+    {
+        uint32_t cur = a.load(std::memory_order_relaxed);
+        while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+    }
 
     /* Bytes one frame of interleaved float samples occupies. */
     static int frame_bytes(void)
@@ -42,6 +57,17 @@ namespace SoLoud
         Soloud *soloud = (Soloud *)userdata;
         if (!soloud || !gScratch) return;
 
+        const uint64_t freq = SDL_GetPerformanceFrequency();
+        const uint64_t t0 = SDL_GetPerformanceCounter();
+        const int req_frames = additional_amount / frame_bytes();
+        gStCallbacks.fetch_add(1, std::memory_order_relaxed);
+        if (gLastCallbackEnd) stat_max(gStMaxGapUs, (uint32_t)((t0 - gLastCallbackEnd) * 1000000 / freq));
+        stat_max(gStMaxReqFrames, (uint32_t)req_frames);
+        /* The device asked for more than two blocks at once: it ran dry or
+           nearly so while we were away. Nothing queued at all = it played silence. */
+        if (req_frames > (int)gBufferFrames * 2) gStLate.fetch_add(1, std::memory_order_relaxed);
+        if (SDL_GetAudioStreamQueued(stream) == 0) gStEmpty.fetch_add(1, std::memory_order_relaxed);
+
         while (additional_amount > 0) {
             int frames = additional_amount / frame_bytes();
             if (frames <= 0) break;
@@ -55,6 +81,9 @@ namespace SoLoud
             SDL_PutAudioStreamData(stream, gScratch, bytes);
             additional_amount -= bytes;
         }
+
+        gLastCallbackEnd = SDL_GetPerformanceCounter();
+        stat_max(gStMaxMixUs, (uint32_t)((gLastCallbackEnd - t0) * 1000000 / freq));
     }
 
     static void soloud_sdl3_deinit(Soloud *aSoloud)
@@ -113,4 +142,17 @@ namespace SoLoud
         SDL_ResumeAudioStreamDevice(gAudioStream);
         return SO_NO_ERROR;
     }
+}
+
+extern "C" bool audio_backend_take_stats(AudioBackendStats *out)
+{
+    using namespace SoLoud;
+    out->callbacks  = gStCallbacks.exchange(0);
+    out->empty      = gStEmpty.exchange(0);
+    out->late       = gStLate.exchange(0);
+    out->max_mix_us = gStMaxMixUs.exchange(0);
+    out->max_gap_us = gStMaxGapUs.exchange(0);
+    out->max_request_frames = gStMaxReqFrames.exchange(0);
+    out->block_frames = gBufferFrames;
+    return out->callbacks != 0;
 }

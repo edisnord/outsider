@@ -788,6 +788,17 @@ bool game_loop_step(GameLoop *loop)
                 loop->perf_acc.swap_ms / n, loop->perf_acc.present_ms / n,
                 loop->perf_worst.total_ms, loop->perf_worst.raf_ms, loop->perf_worst.swap_ms,
                 loop->perf_slow_frames);
+            AudioBackendStats as;
+            if (audio_backend_take_stats(&as)) {
+                error_handler_log(LOG_INFO,
+                    "audio: %u callbacks, %u found the queue empty, %u late (>2 blocks of %u frames); "
+                    "longest callback %.1f ms, longest gap %.1f ms, largest request %u frames",
+                    as.callbacks, as.empty, as.late, as.block_frames,
+                    as.max_mix_us / 1000.0, as.max_gap_us / 1000.0, as.max_request_frames);
+                if (as.late)
+                    compat_report("audio", "mixer starved", "device ran dry: %u empty, %u late, longest callback %.1f ms",
+                                  as.empty, as.late, as.max_mix_us / 1000.0);
+            }
             memset(&loop->perf_acc, 0, sizeof(loop->perf_acc));
             memset(&loop->perf_worst, 0, sizeof(loop->perf_worst));
             loop->perf_slow_frames = 0;
