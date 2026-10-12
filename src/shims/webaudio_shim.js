@@ -176,6 +176,11 @@
         this._nativeHandle = 0;
     }
 
+    /* A sound that does not play leaves no trace otherwise; each cause is reported once to the compat log. */
+    function _audioNote(key, detail) {
+        if (typeof globalThis.__compat_report === "function") globalThis.__compat_report("audio", key, detail);
+    }
+
     function _attachNativeHandle(buffer, handle) {
         buffer._nativeHandle = handle;
         if (handle && _audioBufferRegistry) {
@@ -254,7 +259,11 @@
         if (this._started) return;
         this._started = true;
 
-        if (!this.buffer || !this.buffer._nativeHandle || !_native) return;
+        if (!this.buffer || !this.buffer._nativeHandle || !_native) {
+            _audioNote("start without a decoded buffer", !this.buffer ? "no buffer set" :
+                       (!this.buffer._nativeHandle ? "buffer has no native source (duration " + this.buffer.duration + ")" : "no native audio"));
+            return;
+        }
 
         var gainNode = null;
         var pannerNode = null;
@@ -275,6 +284,8 @@
 
         var voice = _native.play(this.buffer._nativeHandle, bus, volume, pitch, pan, looping);
         this._voiceHandle = voice;
+        if (!voice) _audioNote("play returned no voice", "volume " + volume + ", pitch " + pitch + ", pan " + pan +
+                               ", loop " + looping + ", duration " + this.buffer.duration);
 
         /* Let gain/panner nodes apply live parameter changes to this voice. */
         if (gainNode) gainNode._voiceHandle = voice;
@@ -475,6 +486,8 @@
 
                 var handle = _native.loadFromMemory(data);
                 if (!handle) {
+                    _audioNote("decodeAudioData failed", "the native decoder rejected " +
+                               (data && data.byteLength) + " bytes");
                     reject(new Error("Failed to decode audio data"));
                     return;
                 }
