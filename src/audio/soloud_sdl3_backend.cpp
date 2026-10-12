@@ -105,7 +105,7 @@ namespace SoLoud
                 return UNKNOWN_ERROR;
         }
 
-        if (aSamplerate == 0) aSamplerate = 44100;
+        if (aSamplerate == 0) aSamplerate = 48000;   /* the PS5 device runs at 48 kHz; 44.1 made SDL resample every block */
         if (aBuffer == 0) aBuffer = 2048;
         if (aChannels == 0) aChannels = 2;
 
