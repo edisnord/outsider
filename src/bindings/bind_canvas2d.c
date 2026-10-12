@@ -595,6 +595,25 @@ static JSValue js_c2d_draw_image(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* drawCanvas(handle, sourceHandle, sx, sy, sw, sh, dx, dy, dw, dh): drawImage with another canvas as the source,
+   without copying its pixels into an ArrayBuffer first (that copy was 1.8 ms per call for a battler-sized tint). */
+static JSValue js_c2d_draw_canvas(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    RMMZ_PROF_SCOPE("canvas2d.c2d_draw_canvas");
+    (void)this_val;
+    if (argc < 10)
+        return JS_ThrowTypeError(ctx, "drawCanvas requires 10 arguments");
+    uint32_t handle, src;
+    if (JS_ToUint32(ctx, &handle, argv[0])) return JS_EXCEPTION;
+    if (JS_ToUint32(ctx, &src, argv[1])) return JS_EXCEPTION;
+    int v[8];
+    for (int i = 0; i < 8; i++)
+        if (JS_ToInt32(ctx, &v[i], argv[2 + i])) return JS_EXCEPTION;
+    canvas2d_draw_canvas(handle, src, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    return JS_UNDEFINED;
+}
+
 /* drawImageHandle(handle, imageHandle, sx, sy, sw, sh, dx, dy, dw, dh)
    Like drawImage but takes an image_loader handle instead of pixel ArrayBuffer. */
 static JSValue js_c2d_draw_image_handle(JSContext *ctx, JSValueConst this_val,
@@ -904,6 +923,7 @@ static const JSCFunctionListEntry js_c2d_funcs[] = {
     JS_CFUNC_DEF("strokeRect",       5, js_c2d_stroke_rect),
     JS_CFUNC_DEF("drawImage",       12, js_c2d_draw_image),
     JS_CFUNC_DEF("drawImageHandle", 10, js_c2d_draw_image_handle),
+    JS_CFUNC_DEF("drawCanvas",      10, js_c2d_draw_canvas),
     JS_CFUNC_DEF("adjustTone",       4, js_c2d_adjust_tone),
     JS_CFUNC_DEF("getImageData",     5, js_c2d_get_image_data),
     JS_CFUNC_DEF("putImageData",     6, js_c2d_put_image_data),

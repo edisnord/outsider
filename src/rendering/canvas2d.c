@@ -1384,6 +1384,25 @@ void canvas2d_draw_image(Canvas2DHandle h,
     }
 }
 
+void canvas2d_draw_canvas(Canvas2DHandle h, Canvas2DHandle src,
+                          int sx, int sy, int sw, int sh,
+                          int dx, int dy, int dw, int dh)
+{
+    Canvas2DCtx *d = find_ctx(h);
+    Canvas2DCtx *s = find_ctx(src);
+    if (!d || !s || !s->pixels || s->width <= 0 || s->height <= 0) return;
+    if (d == s) {
+        size_t n = (size_t)s->width * (size_t)s->height * 4;
+        uint8_t *copy = malloc(n);
+        if (!copy) return;
+        memcpy(copy, s->pixels, n);
+        canvas2d_draw_image(h, copy, s->width, s->height, sx, sy, sw, sh, dx, dy, dw, dh);
+        free(copy);
+        return;
+    }
+    canvas2d_draw_image(h, s->pixels, s->width, s->height, sx, sy, sw, sh, dx, dy, dw, dh);
+}
+
 /* Pixel manipulation */
 
 /* Adds r, g, b to the colour channels of every pixel, clamped to 0..255 (alpha untouched): what RPG Maker MV's

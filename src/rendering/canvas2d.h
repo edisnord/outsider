@@ -122,6 +122,11 @@ void canvas2d_draw_image(Canvas2DHandle h,
                           int sx, int sy, int sw, int sh,
                           int dx, int dy, int dw, int dh);
 
+/* Same, with another canvas as the source: no copy of its pixels. Drawing a canvas onto itself works on a copy. */
+void canvas2d_draw_canvas(Canvas2DHandle h, Canvas2DHandle src,
+                          int sx, int sy, int sw, int sh,
+                          int dx, int dy, int dw, int dh);
+
 /* Pixel manipulation */
 
 /* Copy a region of the canvas pixel data into `out`.

@@ -234,13 +234,13 @@
     CanvasRenderingContext2D.prototype._syncFillColor = function() {
         if (!this._handle) return;
         if (this._fillStyle instanceof CanvasGradient) return;
-        var c = parseColor(this._fillStyle);
+        var c = _parseColorShared(this._fillStyle);   /* read only */
         __native_canvas2d.setFillColor(this._handle, c[0], c[1], c[2], c[3]);
     };
 
     CanvasRenderingContext2D.prototype._syncStrokeColor = function() {
         if (!this._handle) return;
-        var c = parseColor(this._strokeStyle);
+        var c = _parseColorShared(this._strokeStyle);   /* read only */
         __native_canvas2d.setStrokeColor(this._handle, c[0], c[1], c[2], c[3]);
     };
 
@@ -461,7 +461,7 @@
 
         /* Supports the 3-, 5- and 9-argument forms. */
         var a = arguments, n = a.length;
-        var srcW = 0, srcH = 0, srcPixels = null;
+        var srcW = 0, srcH = 0, srcPixels = null, srcCanvas = 0;
         var useHandle = !!(source._imageHandle && typeof __native_canvas2d.drawImageHandle !== "undefined");
 
         if (useHandle) {
@@ -470,7 +470,12 @@
             srcH = source._naturalHeight || source._height || 0;
         } else if (source.tagName === "CANVAS" && source._context2d) {
             if (source._context2d._handle) {
-                srcPixels = __native_canvas2d.getPixels(source._context2d._handle);
+                if (typeof __native_canvas2d.drawCanvas === "function") {
+                    /* canvas to canvas inside the native layer: no copy of the source's pixels into JS */
+                    srcCanvas = source._context2d._handle;
+                } else {
+                    srcPixels = __native_canvas2d.getPixels(source._context2d._handle);
+                }
                 srcW = source._width;
                 srcH = source._height;
             }
@@ -479,7 +484,7 @@
             srcW = source._naturalWidth || source._width || 0;
             srcH = source._naturalHeight || source._height || 0;
         }
-        if (!srcW || !srcH || (!useHandle && !srcPixels)) return;
+        if (!srcW || !srcH || (!useHandle && !srcPixels && !srcCanvas)) return;
 
         var sx = 0, sy = 0, sw = srcW, sh = srcH, dx, dy, dw, dh;
         if (n <= 3) {
@@ -496,6 +501,9 @@
 
         if (useHandle) {
             __native_canvas2d.drawImageHandle(this._handle, source._imageHandle,
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+        } else if (srcCanvas) {
+            __native_canvas2d.drawCanvas(this._handle, srcCanvas,
                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
         } else {
             __native_canvas2d.drawImage(this._handle, srcPixels, srcW, srcH,
