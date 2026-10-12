@@ -2390,21 +2390,23 @@
             );
         }
 
-        if (!this._texture || !this._texture.valid) {
-            /* Still render children even if this sprite has no valid texture. */
-            for (var i = 0; i < this.children.length; i++) {
-                this.children[i].render(renderer);
-            }
-            if (useScissor) __native_renderer.clearScissor();
-            return;
-        }
-
+        /* Filters come first: MV's scene root (Spriteset_Base._baseSprite, which carries the tone filter that every
+           Tint Screen event uses) is a Sprite with no texture, and the filter must still apply to its children. */
         if (this.filters && this.filters.length > 0 &&
             !_filtersAreNoOp(this.filters) &&
             typeof __native_filters !== "undefined" &&
             typeof __native_renderer !== "undefined" && __native_renderer._active) {
             if (useScissor) __native_renderer.clearScissor();
             this._renderFiltered(renderer);
+            return;
+        }
+
+        if (!this._texture || !this._texture.valid) {
+            /* Still render children even if this sprite has no valid texture. */
+            for (var i = 0; i < this.children.length; i++) {
+                this.children[i].render(renderer);
+            }
+            if (useScissor) __native_renderer.clearScissor();
             return;
         }
 
@@ -4912,7 +4914,7 @@
         /* Clear to transparent black so filters preserve alpha. */
         __native_renderer.beginFrameTransparent();
 
-        if (this._renderSelf) {
+        if (this._renderSelf && (!this.isSprite || (this._texture && this._texture.valid))) {
             this._renderSelf(renderer);
         }
         for (var i = 0; i < this.children.length; i++) {
